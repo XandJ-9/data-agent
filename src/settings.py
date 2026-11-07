@@ -8,6 +8,15 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="DATA_AGENT_", env_file=".env", extra="ignore")
 
     database_path: Path = Path("data/agent.db")
+    database_url: SecretStr | None = None
+
+    @property
+    def resolved_database_url(self):
+        if self.database_url is not None:
+            return self.database_url
+        from sqlalchemy.engine import URL
+        return URL.create('sqlite', database=str(self.database_path))
+
     host: str = "127.0.0.1"
     port: int = 8100
     public_origin: str = "http://localhost:8100"
@@ -22,7 +31,8 @@ class Settings(BaseSettings):
     max_tool_rounds: int = Field(default=8, ge=1, le=20)
     lease_seconds: int = Field(default=120, ge=15)
     poll_seconds: float = Field(default=1, gt=0, le=60)
-    skills_path: Path = Path(__file__).parent / "skills"
+    log_level: str = 'INFO'
+    skills_path: Path = Path(__file__).resolve().parent.parent / "skills"
     web_dist: Path = Path("web/dist")
     feishu_app_id: str = ""
     feishu_app_secret: SecretStr = SecretStr("")

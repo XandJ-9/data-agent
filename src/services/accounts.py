@@ -1,4 +1,4 @@
-"""Local accounts and opaque, hashed server-side browser sessions."""
+"""Account use cases: local accounts and opaque, hashed server-side browser sessions."""
 import hashlib
 import secrets
 import time
@@ -6,7 +6,9 @@ import time
 from argon2 import PasswordHasher
 from argon2.exceptions import VerificationError
 
-from data_agent.db import ServiceError, Store, identifier
+from errors import ServiceError
+from ids import identifier
+from storage import Store
 
 HASHER = PasswordHasher()
 DUMMY_HASH = HASHER.hash('non-account-timing-placeholder')
@@ -17,18 +19,29 @@ def digest(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
 
-def create_user(store: Store, username: str, password: str) -> dict:
+def create_user(store: Store, username: str, password: str, *, admin: bool = False) -> dict:
     username = username.strip()
     if not 1 <= len(username) <= 100 or not 12 <= len(password) <= 1024:
         raise ServiceError(400, 'Username required; password must contain 12 to 1024 characters')
     user = {'id': identifier(), 'username': username}
     password_hash = HASHER.hash(password)
     with store.transaction() as conn:
-        if conn.execute('SELECT 1 FROM users WHERE username=?', (username,)).fetchone():
+        if store.accounts.username_taken(conn, username):
             raise ServiceError(409, 'Username already exists')
-        conn.execute('INSERT INTO users VALUES(?,?,?)', (user['id'], username, password_hash))
-        conn.execute('INSERT INTO user_memories(user_id) VALUES(?)', (user['id'],))
+        store.accounts.insert_user(conn, user['id'], username, password_hash)
+        store.memory.insert_default(conn, user['id'])
+        if admin:
+            store.accounts.set_admin(conn, user['id'], True)
     return user
+
+
+def set_admin(store: Store, username: str, admin: bool = True) -> dict:
+    with store.transaction() as conn:
+        user_id = store.accounts.user_id_by_username(conn, username)
+        if user_id is None:
+            raise ServiceError(404, 'User not found')
+        store.accounts.set_admin(conn, user_id, admin)
+        return {'username': username, 'is_admin': admin}
 
 
 def login(store: Store, username: str, password: str, seconds: int, peer: str) -> tuple[str, dict]:
@@ -36,15 +49,11 @@ def login(store: Store, username: str, password: str, seconds: int, peer: str) -
     # Both account and source counters prevent distributed guessing and account spraying.
     keys = [digest('account:' + username), digest('peer:' + peer)]
     with store.transaction() as conn:
-        conn.execute('DELETE FROM login_attempts WHERE window_start<?', (now - 300,))
-        for key in keys:
-            row = conn.execute('SELECT attempts FROM login_attempts WHERE key=?', (key,)).fetchone()
-            if row and row['attempts'] >= 20:
+        store.accounts.purge_expired_attempts(conn, now - 300)
+        for key in sorted(keys):
+            if not store.accounts.record_attempt(conn, key, now):
                 raise ServiceError(429, 'Too many login attempts; try again later')
-        for key in keys:
-            conn.execute('INSERT INTO login_attempts VALUES(?,1,?) ON CONFLICT(key) '
-                         'DO UPDATE SET attempts=attempts+1', (key, now))
-        row = conn.execute('SELECT * FROM users WHERE username=?', (username,)).fetchone()
+        row = store.accounts.user_by_username(conn, username)
     try:
         HASHER.verify(row['password_hash'] if row else DUMMY_HASH, password)
     except VerificationError:
@@ -53,22 +62,24 @@ def login(store: Store, username: str, password: str, seconds: int, peer: str) -
         raise ServiceError(401, 'Invalid username or password')
     token, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
     with store.transaction() as conn:
-        conn.execute('DELETE FROM auth_sessions WHERE expires_at<=?', (now,))
-        conn.execute('INSERT INTO auth_sessions VALUES(?,?,?,?)', (digest(token), row['id'], csrf, now + seconds))
-    return token, {'user': {'id': row['id'], 'username': row['username']}, 'csrf_token': csrf}
+        store.accounts.purge_expired_sessions(conn, now)
+        store.accounts.insert_session(conn, digest(token), row['id'], csrf, now + seconds)
+        admin = store.accounts.is_admin(conn, row['id'])
+    return token, {'user': {'id': row['id'], 'username': row['username']},
+                   'csrf_token': csrf, 'is_admin': admin}
 
 
 def authenticate(store: Store, token: str | None) -> dict:
     if not token:
         raise ServiceError(401, 'Authentication required')
     with store.transaction(immediate=False) as conn:
-        row = conn.execute('SELECT u.id,u.username,a.csrf_token FROM auth_sessions a JOIN users u ON u.id=a.user_id '
-                           'WHERE a.token_hash=? AND a.expires_at>?', (digest(token), time.time())).fetchone()
+        row = store.accounts.identity_by_token(conn, digest(token), time.time())
     if row is None:
         raise ServiceError(401, 'Authentication required')
-    return {'user': {'id': row['id'], 'username': row['username']}, 'csrf_token': row['csrf_token']}
+    return {'user': {'id': row['id'], 'username': row['username']},
+            'csrf_token': row['csrf_token'], 'is_admin': bool(row['is_admin'])}
 
 
 def logout(store: Store, token: str) -> None:
     with store.transaction() as conn:
-        conn.execute('DELETE FROM auth_sessions WHERE token_hash=?', (digest(token),))
+        store.accounts.delete_session(conn, digest(token))

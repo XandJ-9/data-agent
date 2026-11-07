@@ -1,289 +1,183 @@
-"""Behavior contracts for the independently implemented agent runtime."""
+"""Reusable runtime core contracts: injection-based, no Settings, storage or network."""
 
 import json
-from copy import deepcopy
-from types import SimpleNamespace
-from typing import Any
 from unittest.mock import Mock
 
 import pytest
 
-from data_agent.runtime import AgentRuntime, RuntimeCancelled, RuntimeFailure
-from data_agent.settings import Settings
-
-
-def response(content: str | None = None, calls: list | None = None) -> SimpleNamespace:
-    return SimpleNamespace(
-        choices=[
-            SimpleNamespace(
-                message=SimpleNamespace(
-                    content=content,
-                    tool_calls=calls or [],
-                    role="assistant",
-                ),
-                finish_reason="tool_calls" if calls else "stop",
-            )
-        ]
-    )
-
-
-def tool(name: str, arguments: Any, call_id: str = "call-1") -> SimpleNamespace:
-    return SimpleNamespace(
-        id=call_id,
-        type="function",
-        function=SimpleNamespace(
-            name=name,
-            arguments=arguments if isinstance(arguments, str) else json.dumps(arguments),
-        ),
-    )
-
-
-def client_for(*responses: Any) -> SimpleNamespace:
-    return SimpleNamespace(
-        chat=SimpleNamespace(
-            completions=SimpleNamespace(
-                create=Mock(side_effect=responses),
-            )
-        )
-    )
-
-
-def settings(**overrides: Any) -> Settings:
-    return Settings(
-        _env_file=None,
-        **{
-            "llm_api_key": "dummy-test-key",
-            "llm_model": "test-model",
-            **overrides,
-        },
-    )
-
-
-def respond(runtime: AgentRuntime, **overrides: Any) -> str:
-    return runtime.respond(
-        **{
-            "messages": [{"role": "user", "content": "Analyze my data"}],
-            "memories": [],
-            "skills": [],
-            "tool_handler": Mock(return_value={}),
-            "cancelled": lambda: False,
-            **overrides,
-        }
-    )
-
-
-def tool_results(client: SimpleNamespace) -> list[dict]:
-    return [
-        message for message in client.chat.completions.create.call_args.kwargs["messages"] if message["role"] == "tool"
-    ]
-
-
-def test_respond_preserves_input_and_includes_current_user_and_memory() -> None:
-    client = client_for(response("分析完成"))
-    messages = [{"role": "user", "content": "比较收入：北京与上海"}]
-    memories = [{"text": "Use CNY for revenue", "source_message_ids": ["old-1"]}]
-    original = deepcopy((messages, memories))
-    assert respond(AgentRuntime(settings(), client=client), messages=messages, memories=memories) == "分析完成"
-    sent = client.chat.completions.create.call_args.kwargs
-    assert sent["model"] == "test-model"
-    assert messages[0] in sent["messages"]
-    assert "Use CNY for revenue" in json.dumps(sent["messages"])
-    assert (messages, memories) == original
-
-
-def test_search_history_delegates_arguments_and_returns_correlated_tool_result() -> None:
-    client = client_for(response(calls=[tool("search_history", {"query": "收入"})]), response("Found it"))
-    handler = Mock(return_value={"matches": ["historical revenue"]})
-    assert respond(AgentRuntime(settings(), client=client), tool_handler=handler) == "Found it"
-    handler.assert_called_once_with("search_history", {"query": "收入"})
-    (result,) = tool_results(client)
-    assert result["tool_call_id"] == "call-1"
-    assert json.loads(result["content"]) == {"matches": ["historical revenue"]}
-
-
-def test_statistics_computes_numeric_results_locally() -> None:
-    client = client_for(response(calls=[tool("calculate_statistics", {"values": [-2, 0, 3.5, 10]})]), response("Done"))
-    handler = Mock(side_effect=AssertionError("Statistics must be local"))
-    respond(AgentRuntime(settings(), client=client), tool_handler=handler)
-    result = json.loads(tool_results(client)[0]["content"])
-    assert result == {"count": 4, "sum": 11.5, "mean": 2.875, "min": -2, "max": 10}
-    handler.assert_not_called()
-
-
-def test_read_skill_uses_only_enabled_snapshot() -> None:
-    client = client_for(
-        response(
-            calls=[
-                tool("read_skill", {"name": "revenue"}, "enabled"),
-                tool("read_skill", {"name": "disabled"}, "disabled"),
-            ]
-        ),
-        response("Done"),
-    )
-    handler = Mock(side_effect=AssertionError("Skills must use the snapshot"))
-    snapshot = [
-        {
-            "name": "revenue",
-            "description": "Revenue analysis",
-            "version": "v1",
-            "content": "SNAPSHOT: use net revenue, 含退款",
-        }
-    ]
-    original = deepcopy(snapshot)
-    respond(AgentRuntime(settings(), client=client), skills=snapshot, tool_handler=handler)
-    results = {item["tool_call_id"]: item["content"] for item in tool_results(client)}
-    assert snapshot[0]["content"] in results["enabled"] or snapshot[0]["content"] in str(json.loads(results["enabled"]))
-    assert json.loads(results["disabled"]).get("error")
-    assert snapshot == original
-    handler.assert_not_called()
-
-
-@pytest.mark.parametrize(
-    ("name", "arguments"),
-    [
-        ("search_history", "{broken"),
-        ("search_history", "null"),
-        ("unknown_tool", {}),
-        ("calculate_statistics", {"values": []}),
-        ("calculate_statistics", {"values": None}),
-        ("calculate_statistics", {"values": ["__import__('os').getcwd()"]}),
-        ("calculate_statistics", {"values": [True]}),
-    ],
+from runtime import (
+    ModelReply,
+    Runtime,
+    RuntimeCancelled,
+    RuntimeConfig,
+    RuntimeFailure,
+    ToolCall,
 )
-def test_invalid_tool_input_returns_safe_error_without_delegation(name: str, arguments: Any) -> None:
-    client = client_for(response(calls=[tool(name, arguments)]), response("Recovered"))
-    handler = Mock(side_effect=AssertionError("Invalid tools must not be delegated"))
-    assert respond(AgentRuntime(settings(), client=client), tool_handler=handler) == "Recovered"
-    assert json.loads(tool_results(client)[0]["content"]).get("error")
-    handler.assert_not_called()
+from tools.builtin import register_statistics
+from tools.registry import ToolDefinition, ToolRegistry
 
 
-def test_tool_failure_does_not_leak_underlying_exception() -> None:
-    secret = "private-db-password-internal-host"
-    client = client_for(response(calls=[tool("search_history", {"query": "sales"})]), response("Unavailable"))
-    handler = Mock(side_effect=ValueError(secret))
-    assert respond(AgentRuntime(settings(), client=client), tool_handler=handler) == "Unavailable"
-    result = tool_results(client)[0]["content"]
-    assert json.loads(result).get("error")
-    assert secret not in result
-    assert "Traceback" not in result
+class FakeProvider:
+    """ModelProvider double: records calls, replays scripted ModelReply objects."""
+
+    def __init__(self, *replies: ModelReply) -> None:
+        self.replies = list(replies)
+        self.calls: list[dict] = []
+
+    def complete(self, config: RuntimeConfig, messages: list[dict], tools: list[dict] | None) -> ModelReply:
+        self.calls.append({"config": config, "messages": [dict(m) for m in messages], "tools": tools})
+        return self.replies.pop(0)
 
 
-def test_tool_round_limit_bounds_execution() -> None:
-    client = client_for(*(response(calls=[tool("search_history", {"query": "again"}, f"call-{i}")]) for i in range(10)))
-    handler = Mock(return_value={"matches": []})
+def reply(content: str | None = None, *calls: ToolCall) -> ModelReply:
+    return ModelReply(content=content, tool_calls=tuple(calls))
+
+
+def echo_registry() -> ToolRegistry:
+    registry = ToolRegistry()
+    registry.register(ToolDefinition(
+        name="echo", description="Echo the given text.",
+        parameters={"text": {"type": "string"}}, required=["text"],
+        handler=lambda args: {"echo": args["text"]}))
+    return registry
+
+
+def stats_registry() -> ToolRegistry:
+    registry = ToolRegistry()
+    register_statistics(registry)
+    return registry
+
+
+def make_runtime(provider: FakeProvider, *, system_prompt: str = "BASE PROMPT", **overrides: object) -> Runtime:
+    config = RuntimeConfig(model_name="core-model", **{
+        "max_tokens": 256, "context_tokens": 8000, **overrides})  # type: ignore[arg-type]
+    return Runtime(config=config, provider=provider, system_prompt=system_prompt)
+
+
+def respond(runtime: Runtime, registry: ToolRegistry, **overrides: object) -> str:
+    return runtime.respond(**{
+        "messages": [{"role": "user", "content": "question"}],
+        "memories": [],
+        "skills": [],
+        "registry": registry,
+        "cancelled": lambda: False,
+        **overrides,
+    })
+
+
+def test_system_prompt_and_config_are_injected_per_runtime() -> None:
+    first = FakeProvider(reply("a"))
+    second = FakeProvider(reply("b"))
+    respond(make_runtime(first, system_prompt="PROMPT ONE"), echo_registry())
+    respond(make_runtime(second, system_prompt="PROMPT TWO", max_tokens=99), echo_registry())
+    assert first.calls[0]["messages"][0] == {"role": "system", "content": "PROMPT ONE"}
+    assert second.calls[0]["messages"][0] == {"role": "system", "content": "PROMPT TWO"}
+    assert first.calls[0]["config"].model_name == "core-model"
+    assert second.calls[0]["config"].max_tokens == 99
+
+
+def test_injected_registry_schemas_and_dispatch_flow() -> None:
+    provider = FakeProvider(reply(None, ToolCall(id="c1", name="echo", arguments='{"text": "hi"}')), reply("final"))
+    registry = echo_registry()
+    assert respond(make_runtime(provider), registry) == "final"
+    sent_tools = provider.calls[0]["tools"]
+    assert [t["function"]["name"] for t in sent_tools] == ["echo"]
+    assistant, tool_message = provider.calls[1]["messages"][-2:]
+    assert assistant["tool_calls"][0]["function"]["name"] == "echo"
+    assert tool_message == {"role": "tool", "tool_call_id": "c1", "content": json.dumps({"echo": "hi"})}
+
+
+def test_same_core_with_a_different_generic_toolset() -> None:
+    provider = FakeProvider(
+        reply(None, ToolCall(id="s1", name="calculate_statistics", arguments='{"values": [1, 3]}')),
+        reply("stats done"),
+    )
+    assert respond(make_runtime(provider), stats_registry()) == "stats done"
+    tool_message = provider.calls[1]["messages"][-1]
+    assert json.loads(tool_message["content"]) == {"count": 2, "sum": 4, "mean": 2, "min": 1, "max": 3}
+
+
+def test_memory_and_skill_reference_stay_out_of_the_system_prompt() -> None:
+    provider = FakeProvider(reply("ok"))
+    respond(make_runtime(provider), echo_registry(),
+            memories=[{"text": "prefers CNY"}],
+            skills=[{"name": "sales", "description": "Sales skill"}])
+    sent = provider.calls[0]["messages"]
+    assert sent[0]["role"] == "system" and "prefers CNY" not in sent[0]["content"]
+    reference = sent[1]
+    assert reference["role"] == "user"
+    assert "prefers CNY" in reference["content"] and "Sales skill" in reference["content"]
+
+
+def test_tool_round_budget_bounds_execution() -> None:
+    replies = [reply(None, ToolCall(id=f"c{i}", name="echo", arguments='{"text": "x"}')) for i in range(5)]
+    provider = FakeProvider(*replies)
     with pytest.raises(RuntimeFailure):
-        respond(AgentRuntime(settings(max_tool_rounds=2), client=client), tool_handler=handler)
-    assert handler.call_count <= 2
-    assert client.chat.completions.create.call_count <= 3
+        respond(make_runtime(provider, max_tool_rounds=2), echo_registry())
+    assert provider.calls[-1]["messages"][-1]["role"] == "tool"
+    assert len(provider.calls) == 2
 
 
-@pytest.mark.parametrize("during_request", [False, True])
-def test_cancellation_stops_before_tools_execute(during_request: bool) -> None:
-    client = client_for(response(calls=[tool("search_history", {"query": "sales"})]))
-    handler = Mock()
-
-    def cancelled() -> bool:
-        return not during_request or client.chat.completions.create.call_count > 0
-
+def test_cancellation_stops_before_completion_and_dispatch() -> None:
+    provider = FakeProvider(reply(None, ToolCall(id="c1", name="echo", arguments='{"text": "x"}')))
+    handler = Mock(side_effect=AssertionError("must not run"))
+    registry = echo_registry()
+    registry.register(ToolDefinition(name="echo", description="d", parameters={},
+                                     required=[], handler=handler))
     with pytest.raises(RuntimeCancelled):
-        respond(AgentRuntime(settings(), client=client), tool_handler=handler, cancelled=cancelled)
-    handler.assert_not_called()
-    assert client.chat.completions.create.call_count == int(during_request)
+        respond(make_runtime(provider), registry, cancelled=lambda: True)
+    assert provider.calls == []
 
 
-@pytest.mark.parametrize("missing", [{"llm_api_key": ""}, {"llm_model": ""}])
-def test_missing_model_configuration_fails_without_network(missing: dict) -> None:
-    client = client_for(response("Should not run"))
+def test_empty_or_oversized_final_reply_is_rejected() -> None:
+    provider = FakeProvider(reply("   "))
     with pytest.raises(RuntimeFailure):
-        respond(AgentRuntime(settings(**missing), client=client))
-    client.chat.completions.create.assert_not_called()
+        respond(make_runtime(provider), echo_registry())
+    big = FakeProvider(reply("x" * 64001))
+    with pytest.raises(RuntimeFailure):
+        respond(make_runtime(big), echo_registry())
 
 
-def test_prompt_budget_keeps_latest_user_message_intact_and_rejects_oversize() -> None:
-    client = client_for(response("Done"))
-    runtime = AgentRuntime(settings(context_tokens=8000), client=client)
-    latest = {"role": "user", "content": "Keep this entire question: 北京 revenue?"}
-    history = [
-        {"role": "user", "content": "old context " * 20000},
-        {"role": "assistant", "content": "old answer " * 20000},
-        latest,
-    ]
-    assert respond(runtime, messages=history) == "Done"
-    sent = client.chat.completions.create.call_args.kwargs["messages"]
+def test_context_budget_trims_history_but_keeps_current_question() -> None:
+    provider = FakeProvider(reply("done"))
+    latest = {"role": "user", "content": "current question"}
+    history = [{"role": "user", "content": "old " * 9000}, {"role": "assistant", "content": "answer " * 9000}]
+    assert respond(make_runtime(provider), echo_registry(), messages=[*history, latest]) == "done"
+    sent = provider.calls[0]["messages"]
     assert latest in sent
-    assert len(json.dumps(sent)) < len(json.dumps(history))
-    with pytest.raises(RuntimeFailure):
-        respond(runtime, messages=[{"role": "user", "content": "超出预算 " * 100000}])
-    assert client.chat.completions.create.call_count == 1
+    assert "old " * 9000 not in json.dumps(sent, ensure_ascii=False)
 
 
-BATCH = [
-    {"id": "user-1", "role": "user", "content": "Please use CNY in reports"},
-    {"id": "assistant-1", "role": "assistant", "content": "I assume you live in Beijing"},
-]
-
-
-def test_extract_memory_accepts_current_user_sources_and_empty_entries() -> None:
-    entries = [{"text": "Use CNY in reports", "source_message_ids": ["user-1"]}]
-    client = client_for(response(json.dumps({"entries": entries})), response('{"entries": []}'))
-    runtime = AgentRuntime(settings(), client=client)
-    original = deepcopy(BATCH)
-    assert runtime.extract_memory(previous=[], messages=BATCH) == entries
-    assert runtime.extract_memory(previous=entries, messages=BATCH) == []
-    assert BATCH == original
-
-
-@pytest.mark.parametrize(
-    "payload",
-    [
-        "not json",
-        "null",
-        "[]",
-        "{}",
-        '{"entries": null}',
-        json.dumps({"entries": [{"text": "Assumption", "source_message_ids": ["assistant-1"]}]}),
-        json.dumps({"entries": [{"text": "Stale", "source_message_ids": ["old-user"]}]}),
-        json.dumps({"entries": [{"text": "No source", "source_message_ids": []}]}),
-        json.dumps({"entries": [{"text": "", "source_message_ids": ["user-1"]}]}),
-        json.dumps({"entries": [{"text": 42, "source_message_ids": ["user-1"]}]}),
-    ],
-)
-def test_extract_memory_rejects_invalid_structure_or_untrusted_sources(payload: str) -> None:
-    runtime = AgentRuntime(settings(), client=client_for(response(payload)))
-    with pytest.raises(RuntimeFailure):
-        runtime.extract_memory(previous=[{"text": "Old", "source_message_ids": ["old-user"]}], messages=BATCH)
-
-
-def test_extract_memory_filters_sensitive_tokens_and_bounds_entries_and_text() -> None:
-    secret = "sk-test-only-" + "x" * 48
-    entries = [
-        {"text": f"API key: {secret}", "source_message_ids": ["user-1"]},
-        {"text": "Authorization: Bearer test-only-access-token", "source_message_ids": ["user-1"]},
+def test_on_event_observes_assistant_tool_calls_and_results() -> None:
+    provider = FakeProvider(
+        ModelReply(content='先检索', reasoning='需要历史', tool_calls=(
+            ToolCall(id="c1", name="echo", arguments='{"text": "hi"}'),)),
+        reply("final"))
+    events: list[dict] = []
+    assert respond(make_runtime(provider), echo_registry(), on_event=events.append) == "final"
+    assert events == [
+        {'kind': 'assistant', 'content': '先检索', 'reasoning': '需要历史'},
+        {'kind': 'tool_call', 'name': 'echo', 'content': '{"text": "hi"}'},
+        {'kind': 'tool_result', 'name': 'echo', 'content': json.dumps({"echo": "hi"})},
     ]
-    safe = [{"text": f"Preference {i}: " + "x" * 600, "source_message_ids": ["user-1"]} for i in range(25)]
-    runtime = AgentRuntime(settings(), client=client_for(response(json.dumps({"entries": entries + safe}))))
-    # Rejecting an over-limit model result is also safe; silently accepting it is not.
-    try:
-        result = runtime.extract_memory(previous=[], messages=BATCH)
-    except RuntimeFailure:
-        pass
-    else:
-        assert len(result) <= 20
-        assert all(0 < len(entry["text"]) <= 500 for entry in result)
-        assert secret not in json.dumps(result)
-        assert "test-only-access-token" not in json.dumps(result)
-    clean_client = client_for(
-        response(
-            json.dumps(
-                {
-                    "entries": entries
-                    + [
-                        {"text": "Use CNY", "source_message_ids": ["user-1"]},
-                    ]
-                }
-            )
-        )
-    )
-    cleaned = AgentRuntime(settings(), client=clean_client).extract_memory(previous=[], messages=BATCH)
-    assert cleaned == [{"text": "Use CNY", "source_message_ids": ["user-1"]}]
+
+
+def test_final_round_reasoning_is_emitted_without_duplicating_content() -> None:
+    provider = FakeProvider(ModelReply(content='done', reasoning='deduced the answer'))
+    events: list[dict] = []
+    assert respond(make_runtime(provider), echo_registry(), on_event=events.append) == "done"
+    assert events == [{'kind': 'assistant', 'content': '', 'reasoning': 'deduced the answer'}]
+
+
+def test_no_events_without_observer() -> None:
+    provider = FakeProvider(reply(None, ToolCall(id="c1", name="echo", arguments='{"text": "hi"}')), reply("final"))
+    assert respond(make_runtime(provider), echo_registry()) == "final"  # default path stays silent
+
+
+def test_complete_is_a_single_provider_round_trip() -> None:
+    provider = FakeProvider(reply("plain"))
+    runtime = make_runtime(provider)
+    result = runtime.complete([{"role": "user", "content": "hi"}])
+    assert result.content == "plain" and result.tool_calls == ()
+    assert provider.calls[0]["tools"] is None
+    assert provider.calls[0]["messages"] == [{"role": "user", "content": "hi"}]

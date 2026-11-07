@@ -25,8 +25,6 @@ FEISHU_TEXT_LIMIT = 3000
 MAX_ATTEMPTS = 8
 BACKOFF_BASE = 2.0
 BACKOFF_CAP = 300.0
-DELIVERY_TABLE = 'deliveries'
-REPLY_TABLE = 'feishu_replies'
 
 
 class DeliveryError(Exception):
@@ -79,40 +77,25 @@ def partition_reply(text: str, limit: int = FEISHU_TEXT_LIMIT) -> list[str]:
     return [part + f' ({index}/{count})' for index, part in enumerate(parts, start=1)]
 
 
-def _claim_batch(store, table: str, order_column: str, owner: str, lease_seconds: int,
+def _claim_batch(store, outbox, owner: str, lease_seconds: int,
                  clock: Callable[[], float], limit: int) -> list[dict]:
-    now = clock()
     with store.transaction() as conn:
-        conn.execute(f"UPDATE {table} SET status='unknown',generation=generation+1 "
-                     "WHERE status='sending' AND lease_until<=?", (now,))
-        rows = conn.execute(f'SELECT id FROM {table} WHERE status="pending" AND retry_at<=? '
-                            f'ORDER BY {order_column},id LIMIT ?', (now, limit)).fetchall()
-        claimed = []
-        for row in rows:
-            cursor = conn.execute(f"UPDATE {table} SET status='sending',owner=?,generation=generation+1,"
-                                  'lease_until=? WHERE id=? AND status="pending"',
-                                  (owner, now + lease_seconds, row['id']))
-            if cursor.rowcount == 1:
-                claimed.append(dict(conn.execute(f'SELECT * FROM {table} WHERE id=?', (row['id'],)).fetchone()))
-        return claimed
+        return outbox.claim_batch(conn, owner, lease_seconds, clock(), limit)
 
 
-def _finish(store, table: str, row: dict, status: str, *, receipt: str | None = None,
+def _finish(store, outbox, row: dict, status: str, *, receipt: str | None = None,
             error_code: str | None = None, retry_at: float = 0,
             clock: Callable[[], float] = time.time) -> bool:
     """Fenced transition out of 'sending'; a lost lease means another owner moved on."""
     with store.transaction() as conn:
-        cursor = conn.execute(f'UPDATE {table} SET status=?,receipt=?,error_code=?,attempts=attempts+1,'
-                              'retry_at=? WHERE id=? AND status="sending" AND owner=? AND generation=?',
-                              (status, receipt, error_code, retry_at, row['id'], row['owner'], row['generation']))
-        return cursor.rowcount == 1
+        return outbox.finish(conn, row, status, receipt=receipt, error_code=error_code,
+                             retry_at=retry_at, now=clock())
 
 
 def _binding_valid(store, binding_id: str, reply_target: str) -> bool:
     """Re-validate before any network send: binding active and target still the bound open_id."""
     with store.transaction(immediate=False) as conn:
-        row = conn.execute('SELECT active,external_user_id FROM channel_identities WHERE id=?',
-                           (binding_id,)).fetchone()
+        row = store.channels.get_active(conn, binding_id)
     return row is not None and bool(row['active']) and row['external_user_id'] == reply_target
 
 
@@ -124,11 +107,11 @@ def process_deliveries(store, sender, *, app_id: str, app_secret: str, owner: st
                        lease_seconds: int = 120, clock: Callable[[], float] = time.time,
                        limit: int = 50) -> int:
     """Claim pending deliveries and send every <=3000-byte part in order."""
-    claimed = _claim_batch(store, DELIVERY_TABLE, 'retry_at', owner, lease_seconds, clock, limit)
+    claimed = _claim_batch(store, store.outbox_deliveries, owner, lease_seconds, clock, limit)
     sent = 0
     for row in claimed:
         if not _binding_valid(store, row['binding_id'], row['reply_target']):
-            if _finish(store, DELIVERY_TABLE, row, 'failed', error_code='binding_revoked', clock=clock):
+            if _finish(store, store.outbox_deliveries, row, 'failed', error_code='binding_revoked', clock=clock):
                 sent += 1
             continue
         parts = partition_reply(row['content'])
@@ -137,20 +120,20 @@ def process_deliveries(store, sender, *, app_id: str, app_secret: str, owner: st
             for index, part in enumerate(parts):
                 receipt = sender(app_id, app_secret, row['reply_target'], part, f"dl-{row['id']}:{index}")
         except DeliveryTimeout:
-            if _finish(store, DELIVERY_TABLE, row, 'unknown', error_code='timeout', clock=clock):
+            if _finish(store, store.outbox_deliveries, row, 'unknown', error_code='timeout', clock=clock):
                 sent += 1
             continue
         except DeliveryApiError as exc:
             attempts = row['attempts'] + 1
             if attempts >= MAX_ATTEMPTS:
-                done = _finish(store, DELIVERY_TABLE, row, 'failed', error_code=exc.code, clock=clock)
+                done = _finish(store, store.outbox_deliveries, row, 'failed', error_code=exc.code, clock=clock)
             else:
-                done = _finish(store, DELIVERY_TABLE, row, 'pending', error_code=exc.code,
+                done = _finish(store, store.outbox_deliveries, row, 'pending', error_code=exc.code,
                                retry_at=_backoff(attempts, clock), clock=clock)
             if done:
                 sent += 1
             continue
-        if _finish(store, DELIVERY_TABLE, row, 'delivered', receipt=receipt, clock=clock):
+        if _finish(store, store.outbox_deliveries, row, 'delivered', receipt=receipt, clock=clock):
             sent += 1
     return sent
 
@@ -164,26 +147,26 @@ def process_replies(store, sender, *, app_id: str, app_secret: str, owner: str =
     re-validated against the binding: a /stop confirmation must still arrive
     after the binding was deactivated.
     """
-    claimed = _claim_batch(store, REPLY_TABLE, 'created_at', owner, lease_seconds, clock, limit)
+    claimed = _claim_batch(store, store.outbox_replies, owner, lease_seconds, clock, limit)
     sent = 0
     for row in claimed:
         try:
             receipt = sender(app_id, app_secret, row['reply_target'], row['content'], row['uuid'])
         except DeliveryTimeout:
-            if _finish(store, REPLY_TABLE, row, 'unknown', error_code='timeout', clock=clock):
+            if _finish(store, store.outbox_replies, row, 'unknown', error_code='timeout', clock=clock):
                 sent += 1
             continue
         except DeliveryApiError as exc:
             attempts = row['attempts'] + 1
             if attempts >= MAX_ATTEMPTS:
-                done = _finish(store, REPLY_TABLE, row, 'failed', error_code=exc.code, clock=clock)
+                done = _finish(store, store.outbox_replies, row, 'failed', error_code=exc.code, clock=clock)
             else:
-                done = _finish(store, REPLY_TABLE, row, 'pending', error_code=exc.code,
+                done = _finish(store, store.outbox_replies, row, 'pending', error_code=exc.code,
                                retry_at=_backoff(attempts, clock), clock=clock)
             if done:
                 sent += 1
             continue
-        if _finish(store, REPLY_TABLE, row, 'delivered', receipt=receipt, clock=clock):
+        if _finish(store, store.outbox_replies, row, 'delivered', receipt=receipt, clock=clock):
             sent += 1
     return sent
 

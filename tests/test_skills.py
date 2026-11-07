@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from data_agent.skills import load_skills
+from skills.loader import load_skills, parse_skill
 
 
 def write_skill(
@@ -113,3 +113,36 @@ def test_root_checks_reject_files_and_symlinks_escaping_root(tmp_path: Path, esc
             (root / "revenue" / "SKILL.md").symlink_to(external)
     with pytest.raises(ValueError):
         load_skills(root)
+
+
+# ------------------------------------------------------------ parse_skill (upload path)
+
+
+def test_parse_skill_accepts_valid_document_without_directory_context() -> None:
+    skill = parse_skill("---\nname: sales\ndescription: 销售数据口径说明\n---\n正文指引")
+    assert skill["name"] == "sales"
+    assert skill["description"] == "销售数据口径说明"
+    assert skill["version"] == hashlib.sha256(skill["content"].encode("utf-8")).hexdigest()
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        "no frontmatter",
+        "---\nname: Sales\ndescription: d\n---\nBody",
+        "---\nname: ../escape\ndescription: d\n---\nBody",
+        "---\nname: sales\n---\nBody",
+        "---\ndescription: d\n---\nBody",
+        "---\nname: sales\ndescription: " + "x" * 1001 + "\n---\nBody",
+    ],
+)
+def test_parse_skill_rejects_invalid_documents(document: str) -> None:
+    with pytest.raises(ValueError):
+        parse_skill(document)
+
+
+def test_parse_skill_expected_name_must_match() -> None:
+    document = "---\nname: other\ndescription: d\n---\nBody"
+    with pytest.raises(ValueError):
+        parse_skill(document, expected_name="sales")
+    assert parse_skill(document, expected_name="other")["name"] == "other"

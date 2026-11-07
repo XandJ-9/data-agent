@@ -24,11 +24,40 @@ uv run data-agent worker       # 另开终端：执行 Run、投递与长期记�
 
 模型需在 `data-agent/.env` 配置 OpenAI 兼容 `DATA_AGENT_LLM_API_KEY` 与 `DATA_AGENT_LLM_MODEL`；未配置时服务可启动，Run 会以 `configuration_required` 失败。飞书接入配置见 `.env.example`。
 
+### 存储：SQLite（默认）或 PostgreSQL
+
+默认使用 SQLite（`DATA_AGENT_DATABASE_PATH`），零配置即可开发。生产或多人部署设：
+
+```bash
+# .env
+DATA_AGENT_DATABASE_URL=postgresql+psycopg://user:password@localhost:5432/data_agent
+```
+
+两个后端共用同一套 schema 与并发语义（条件 UPDATE + 租约 fencing），切换只改这一行；PG 需 `uv sync --extra postgres` 并先 `init-db`。
+
+## 目录结构
+
+```
+src/
+  runtime/        # 领域无关 Agent 核心：上下文预算、工具循环、Provider 协议
+  tools/          # ToolRegistry：工具定义统一注册与分发
+  providers/      # 模型 Provider 适配（OpenAI 兼容）
+  domains/data/   # 数据助手领域装配：system prompt、领域工具、记忆提炼
+  services/       # 业务用例层（唯一事务边界）
+  storage/        # SQLAlchemy Core 双后端：schema、Database、repositories
+  api/            # FastAPI 网关（路由 / schemas / 依赖）
+  channels/feishu/# 飞书 webhook 验签 + 投递泵（outbox）
+  worker.py       # Run / 记忆 / 投递 三个后台泵
+  cli.py          # 进程入口
+```
+
+依赖单向：`api / channels / worker → services / domains → runtime / tools / providers → storage`；`runtime` 不依赖任何领域与存储模块（`tests/test_architecture.py` 强制）。
+
 ## 开发
 
 ```bash
 uv run ruff check .
-uv run pytest
+uv run pytest                                   # 默认 SQLite；PG 集成测试见 tests/test_postgres.py
 cd web && npm ci && npm run build && npm test
 ```
 

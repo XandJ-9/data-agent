@@ -4,3 +4,35 @@
 @media(max-width:900px){.sidebar{width:225px;padding-inline:12px}.welcome{padding:30px}.welcome h1{font-size:27px}.welcome-cards{gap:10px;margin-top:40px}.welcome-cards article{padding:15px}.settings{padding:30px 24px}.login-story{padding:40px}.login-story h1{font-size:36px}.login-form{padding:30px}}
 @media(max-width:640px){.sidebar{display:none}.sidebar.open{display:flex;position:fixed;z-index:10;inset:0;max-width:none;width:100%;padding:24px}.mobile-only{display:inline-block}.close{margin-left:auto}.topbar{height:58px;padding:0 16px;gap:15px;justify-content:flex-start}.private-label{margin-left:auto;font-size:10px}.welcome{padding:35px 22px}.welcome h1{font-size:25px}.welcome-cards{grid-template-columns:1fr;text-align:left;margin-top:35px}.welcome-cards article{padding:16px}.welcome-cards article>span{float:right}.welcome-cards h3{margin:0 0 6px}.hero-mark{width:60px;height:60px;font-size:34px;margin-bottom:24px}.chat-heading{padding:16px 20px}.chat-heading h1{font-size:18px}.conversation-inner{padding:15px 18px}.message-body{margin-left:0}.runs{margin-left:0}.composer-area{padding:10px 12px}.composer-footer>span{font-size:9px}.settings{padding:28px 18px}.settings>h1{font-size:24px}.panel{padding:19px}.skill-grid{grid-template-columns:1fr}.panel-heading{flex-wrap:wrap}.panel-heading h2{font-size:17px}.entry-meta{align-items:flex-start}.login{grid-template-columns:1fr}.login-story{padding:26px;min-height:240px}.login-story h1{font-size:28px;margin:18px 0 12px}.login-story p,.login-story>small,.login-story .eyebrow{display:none}.login-form{padding:35px 28px}.login-form form{max-width:400px}.feishu-panel dl{grid-template-columns:80px 1fr}}
 @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important}}
+.run-steps{margin-top:10px;display:flex;flex-direction:column;gap:6px}
+.step{border-left:2px solid #dbe4d3;padding:2px 0 2px 12px}
+.step summary{cursor:pointer;color:#6e8b7f;font-size:12px}
+.step pre{margin:8px 0 4px;overflow:auto;max-height:260px;background:#f4f6f0;color:#33473c;padding:10px 12px;border-radius:8px;font-size:11px;white-space:pre-wrap;overflow-wrap:anywhere}
+.step-reasoning summary{color:#9a6b2f}
+.step-reasoning p{margin:8px 0 4px;color:#92642c;font-size:12px;line-height:1.7;white-space:pre-wrap;overflow-wrap:anywhere}
+.run-steps-box{margin:6px 0 12px;border:1px solid var(--line);border-radius:8px;background:#fbfcf9}
+.run-steps-box>summary{cursor:pointer;padding:8px 12px;font-size:12px;color:#6e8b7f;font-weight:550}
+.run-steps-box>.run-steps{margin:0;padding:2px 12px 10px}
+.session-row{position:relative;display:flex;align-items:center}
+.session-row>.session{flex:1;min-width:0}
+.session-menu-btn{flex:none;width:28px;height:28px;padding:0;border:0;background:transparent;color:#b8c2b0;font-size:16px;line-height:1;border-radius:6px;visibility:hidden;display:grid;place-items:center}
+.session-row:hover .session-menu-btn,.session-menu-btn:focus-visible{visibility:visible}
+.session-menu-btn:hover{background:#e0e8d8;color:#5a7060}
+.session-menu{position:absolute;right:6px;top:100%;z-index:5;background:#fff;border:1px solid var(--line);border-radius:8px;box-shadow:0 4px 16px #183b2712;padding:4px;min-width:120px}
+.session-menu button{display:block;width:100%;text-align:left;border:0;background:transparent;padding:8px 12px;font-size:13px}
+.session-menu button:hover{background:#edf2ec}
+.archived-toggle{display:block;width:100%;text-align:left;border:0;background:transparent;color:#8a9489;font-size:11px;padding:8px 12px;margin:4px 0 0}
+.archived-toggle:hover{color:#5a6b5a}
+.archived-list{margin-top:4px}
+.archived .session{color:#9aa897}
+.archived .session.selected{color:#2c5342}
+.editable-title{cursor:pointer;transition:background .15s;padding:2px 8px;margin:-2px -8px;border-radius:6px}
+.editable-title:hover{background:#e8eee5}
+.inline-edit input{font-size:21px;font-weight:550;letter-spacing:-1px;line-height:1.4;padding:4px 8px;border:2px solid var(--green);border-radius:8px;background:#fff}
+.archived-banner{background:#fdf6e8;color:#8a7340;font-size:12px;padding:10px 40px;border-bottom:1px solid #f0e6cc}
+.modal-overlay{position:fixed;inset:0;z-index:20;background:#0003;display:grid;place-items:center}
+.modal{background:#fff;border-radius:14px;padding:28px;min-width:340px;max-width:440px;box-shadow:0 8px 32px #0002}
+.modal h2{font-size:19px;margin-bottom:18px}
+.modal input{font-size:15px}
+.modal-actions{display:flex;gap:10px;justify-content:flex-end;margin-top:18px}
+.modal-actions button{padding:8px 18px}

@@ -8,10 +8,18 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
+from conftest import sql
 
-from data_agent.auth import create_user
-from data_agent.db import Store, identifier
-from data_agent.feishu import (
+from channels.feishu.delivery import (
+    FEISHU_TEXT_LIMIT,
+    DeliveryApiError,
+    DeliveryTimeout,
+    delivery_parts,
+    partition_reply,
+    process_deliveries,
+    process_replies,
+)
+from channels.feishu.webhook import (
     REPLY_ALREADY_BOUND,
     REPLY_HELP,
     REPLY_HELP_COMMANDS,
@@ -22,20 +30,13 @@ from data_agent.feishu import (
     REPLY_STOPPED,
     REPLY_UNSUPPORTED,
     FeishuModule,
-    apply_feishu_schema,
     generate_code,
     sha256_hex,
 )
-from data_agent.feishu_delivery import (
-    FEISHU_TEXT_LIMIT,
-    DeliveryApiError,
-    DeliveryTimeout,
-    delivery_parts,
-    partition_reply,
-    process_deliveries,
-    process_replies,
-)
-from data_agent.settings import Settings
+from ids import identifier
+from services.accounts import create_user
+from settings import Settings
+from storage import Store
 
 APP_ID = 'cli_app'
 TENANT = 'tenant_1'
@@ -53,19 +54,22 @@ def feishu_kwargs(**kw):
 
 
 def module(store, user, **kw) -> FeishuModule:
-    settings = Settings(database_path=store.path, skills_path=store.path.parent / 'skills',
+    settings = Settings(_env_file=None, database_url=None, database_path=store.path,
+                        skills_path=store.path.parent / 'skills',
                         **feishu_kwargs())
     return FeishuModule(store, settings, **kw)
 
 
 def unconfigured_module(store, user) -> FeishuModule:
-    settings = Settings(database_path=store.path, skills_path=store.path.parent / 'skills',
+    settings = Settings(_env_file=None, database_url=None, database_path=store.path,
+                        skills_path=store.path.parent / 'skills',
                         **feishu_kwargs(feishu_encrypt_key=''))
     return FeishuModule(store, settings)
 
 
 def app_settings(store):
-    return Settings(database_path=store.path, skills_path=store.path.parent / 'skills',
+    return Settings(_env_file=None, database_url=None, database_path=store.path,
+                        skills_path=store.path.parent / 'skills',
                     **feishu_kwargs())
 
 
@@ -73,7 +77,6 @@ def app_settings(store):
 def env(tmp_path: Path):
     store = Store(tmp_path / 't.db')
     store.init_db()
-    apply_feishu_schema(store)
     user = create_user(store, 'alice', 'long-test-password')
     other = create_user(store, 'bob', 'another-password')
     return store, user, other
@@ -113,30 +116,30 @@ def make_event(event_id, message_id, text, msg_type='text', chat_type='p2p',
 
 def insert_code(store, user, code):
     with store.transaction() as conn:
-        conn.execute('INSERT INTO binding_codes(code_hash,user_id,expires_at) VALUES(?,?,?)',
+        sql(conn, 'INSERT INTO binding_codes(code_hash,user_id,expires_at) VALUES(?,?,?)',
                      (sha256_hex(code), user['id'], time.time() + 600))
 
 
 def outbox(store):
     with store.transaction(immediate=False) as conn:
-        return [dict(r) for r in conn.execute('SELECT * FROM feishu_replies ORDER BY created_at,id')]
+        return [dict(r._mapping) for r in sql(conn, 'SELECT * FROM feishu_replies ORDER BY created_at,id')]
 
 
 def runs(store):
     with store.transaction(immediate=False) as conn:
-        return [dict(r) for r in conn.execute('SELECT * FROM runs')]
+        return [dict(r._mapping) for r in sql(conn, 'SELECT * FROM runs')]
 
 
 def events(store):
     with store.transaction(immediate=False) as conn:
-        return [dict(r) for r in conn.execute('SELECT * FROM feishu_events')]
+        return [dict(r._mapping) for r in sql(conn, 'SELECT * FROM feishu_events')]
 
 
 def binding_of(store, user_id):
     with store.transaction(immediate=False) as conn:
-        row = conn.execute('SELECT * FROM channel_identities WHERE user_id=? AND channel="feishu" AND active=1',
+        row = sql(conn, 'SELECT * FROM channel_identities WHERE user_id=? AND channel="feishu" AND active=1',
                            (user_id,)).fetchone()
-        return dict(row) if row else None
+        return dict(row._mapping) if row else None
 
 
 def db_dump(store) -> str:
@@ -249,7 +252,7 @@ def test_ingest_replay_event_id_deduped_even_after_session_switch(env):
     mod.ingest(make_event('e1', 'm1', 'hello'))
     sid = store.create_session(user['id'])['id']
     with store.transaction() as conn:
-        conn.execute('UPDATE channel_identities SET session_id=? WHERE user_id=?', (sid, user['id']))
+        sql(conn, 'UPDATE channel_identities SET session_id=? WHERE user_id=?', sid, user['id'])
     assert mod.ingest(make_event('e1', 'm1', 'hello')) is None
     assert len(runs(store)) == 1
 
@@ -285,8 +288,8 @@ def test_bind_success_consumes_code_and_confirms(env):
     assert binding and binding['app_id'] == APP_ID and binding['tenant_id'] == TENANT
     assert binding['external_user_id'] == OPEN_ID
     with store.transaction(immediate=False) as conn:
-        consumed = conn.execute('SELECT consumed_at FROM binding_codes WHERE code_hash=?',
-                                (sha256_hex(code),)).fetchone()
+        consumed = sql(conn, 'SELECT consumed_at FROM binding_codes WHERE code_hash=?',
+                                (sha256_hex(code),)).mappings().one()
     assert consumed['consumed_at'] is not None
     rows = outbox(store)
     assert len(rows) == 1 and REPLY_HELP_COMMANDS in rows[0]['content']
@@ -300,7 +303,7 @@ def test_bind_invalid_code_replies_and_counts_attempt(env):
     rows = outbox(store)
     assert rows[0]['content'] == REPLY_INVALID_CODE
     with store.transaction(immediate=False) as conn:
-        attempts = conn.execute('SELECT attempts FROM feishu_bind_attempts').fetchall()
+        attempts = sql(conn, 'SELECT attempts FROM feishu_bind_attempts').mappings().all()
     assert len(attempts) == 1 and attempts[0]['attempts'] == 1
 
 
@@ -318,8 +321,8 @@ def test_bind_conflict_replies_already_bound(env):
     assert binding_of(store, user['id']) is not None
     assert binding_of(store, other['id']) is None
     with store.transaction(immediate=False) as conn:
-        unconsumed = conn.execute('SELECT consumed_at FROM binding_codes WHERE code_hash=?',
-                                  (sha256_hex(second),)).fetchone()
+        unconsumed = sql(conn, 'SELECT consumed_at FROM binding_codes WHERE code_hash=?',
+                                  (sha256_hex(second),)).mappings().one()
     assert unconsumed['consumed_at'] is None  # conflicting code is never burned
 
 
@@ -342,7 +345,7 @@ def test_concurrent_binds_respect_rate_limit_and_consume_once(env):
     with ThreadPoolExecutor(12) as pool:
         list(pool.map(lambda c: mod.ingest(make_event(f'e-{c[:4]}', f'm-{c[:4]}', f'/bind {c}')), codes))
     with store.transaction(immediate=False) as conn:
-        consumed = conn.execute('SELECT count(*) FROM binding_codes WHERE consumed_at IS NOT NULL').fetchone()[0]
+        consumed = sql(conn, 'SELECT count(*) FROM binding_codes WHERE consumed_at IS NOT NULL').fetchone()[0]
     assert consumed <= 1
     assert len([b for b in [binding_of(store, user['id'])] if b]) == 1
 
@@ -449,7 +452,7 @@ def test_partition_reply_marks_only_multi_segment():
 # ---------------------------------------------------------------- delivery pump
 
 def deliverable_run(store, user, content, session_id=None):
-    from data_agent.chat import submit_message
+    from services.chat import submit_message
     binding = binding_of(store, user['id'])
     sid = session_id or binding['session_id']
     submit_message(store, app_settings(store), user['id'], sid, 'q', identifier(),
@@ -474,7 +477,7 @@ class FakeSender:
 
 def deliveries(store):
     with store.transaction(immediate=False) as conn:
-        return [dict(r) for r in conn.execute('SELECT * FROM deliveries ORDER BY run_id,part')]
+        return [dict(r._mapping) for r in sql(conn, 'SELECT * FROM deliveries ORDER BY run_id,part')]
 
 
 def test_pump_delivers_parts_in_order_with_stable_uuid(env):
@@ -535,7 +538,7 @@ def test_pump_revalidates_binding_before_send(env):
     bound_mod(store, user)
     deliverable_run(store, user, 'answer')
     with store.transaction() as conn:
-        conn.execute("UPDATE channel_identities SET active=0 WHERE user_id=?", (user['id'],))
+        sql(conn, "UPDATE channel_identities SET active=0 WHERE user_id=?", user['id'])
     sender = FakeSender()
     process_deliveries(store, sender, app_id=APP_ID, app_secret=APP_SECRET, owner='w1', lease_seconds=120)
     assert sender.calls == []
@@ -549,8 +552,8 @@ def test_stale_sending_delivery_becomes_unknown(env):
     deliverable_run(store, user, 'answer')
     row = deliveries(store)[0]
     with store.transaction() as conn:
-        conn.execute("UPDATE deliveries SET status='sending',owner='dead',generation=1,lease_until=1 "
-                     "WHERE id=?", (row['id'],))
+        sql(conn, "UPDATE deliveries SET status='sending',owner='dead',generation=1,lease_until=1 "
+                  "WHERE id=?", row['id'])
     process_deliveries(store, FakeSender(), app_id=APP_ID, app_secret=APP_SECRET, owner='w9', lease_seconds=120)
     assert deliveries(store)[0]['status'] == 'unknown'
 
@@ -567,7 +570,7 @@ def test_reply_pump_sends_and_reuses_uuid_on_retry(env):
     assert len(sender.calls) == 1 and sender.calls[0]['uuid'] == uuid
     # user-triggered retry (core endpoint) resets to pending; same uuid is reused
     with store.transaction() as conn:
-        conn.execute("UPDATE feishu_replies SET status='pending' WHERE uuid=?", (uuid,))
+        sql(conn, "UPDATE feishu_replies SET status='pending' WHERE uuid=?", uuid)
     sender.results.clear()
     process_replies(store, sender, app_id=APP_ID, app_secret=APP_SECRET, owner='w2', lease_seconds=120)
     assert sender.calls[1]['uuid'] == uuid
@@ -598,7 +601,7 @@ def test_delivery_parts_rejects_nonpositive_limit():
 
 
 def test_sdk_sender_rejects_credential_mismatch_without_network():
-    from data_agent.feishu_delivery import SdkSender
+    from channels.feishu.delivery import SdkSender
     sender = SdkSender(APP_ID, APP_SECRET)
     with pytest.raises(DeliveryApiError) as excinfo:
         sender(APP_ID, 'wrong-secret', OPEN_ID, 'text', 'u1')
@@ -606,7 +609,7 @@ def test_sdk_sender_rejects_credential_mismatch_without_network():
 
 
 def test_sdk_sender_builds_offline_client():
-    from data_agent.feishu_delivery import SdkSender
+    from channels.feishu.delivery import SdkSender
     sender = SdkSender(APP_ID, APP_SECRET)
     client = sender._get_client()
     assert client.config.app_id == APP_ID and client is sender._get_client()
