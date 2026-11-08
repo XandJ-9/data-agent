@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     max_tool_rounds: int = Field(default=8, ge=1, le=20)
     lease_seconds: int = Field(default=120, ge=15)
     poll_seconds: float = Field(default=1, gt=0, le=60)
+    worker_concurrency: int = Field(default=3, ge=1, le=20)
     log_level: str = 'INFO'
     skills_path: Path = Path(__file__).resolve().parent.parent / "skills"
     web_dist: Path = Path("web/dist")

@@ -14,6 +14,7 @@ dependencies = [
   "lark-oapi>=1.5,<2",
   "sqlalchemy>=2.0,<3",
   "mcp>=1,<2",
+  "psycopg2>=2.9.13",
 ]
 
 [project.optional-dependencies]

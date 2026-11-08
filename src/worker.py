@@ -1,8 +1,14 @@
-"""Durable worker with heartbeat fencing; interrupted runs are never replayed."""
+"""Durable worker with heartbeat fencing; interrupted runs are never replayed.
+
+Concurrency model: a fixed-size thread pool executes runs in parallel while
+the main thread handles claim, memory extraction, and Feishu delivery.
+Each thread owns its Store instance so no connection is shared across threads.
+"""
 import json
 import logging
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from channels.feishu.delivery import SdkSender, process_deliveries, process_replies
@@ -18,7 +24,121 @@ from storage import Store
 logger = logging.getLogger(__name__)
 
 
+def _execute(settings: Settings, run: dict, owner: str, *,
+             runtime: Any = None, mcp_gateway: McpGateway | None = None) -> None:
+    """Execute a single run in a thread. Owns its Store for thread safety."""
+    store = Store(settings.resolved_database_url)
+    try:
+        _execute_with_store(store, settings, run, owner, runtime=runtime, mcp_gateway=mcp_gateway)
+    finally:
+        store.dispose()
+
+
+def _execute_with_store(store: Store, settings: Settings, run: dict, owner: str, *,
+                        runtime: Any = None, mcp_gateway: McpGateway | None = None) -> None:
+    started = time.time()
+    logger.info('Run %s started (model %s thread=%s)', run['id'],
+               json.loads(run['config_snapshot']).get('llm_model'), threading.current_thread().name)
+
+    stop = threading.Event()
+    thread = threading.Thread(target=_heartbeat_loop, args=(store, run, settings.lease_seconds, stop), daemon=True)
+    thread.start()
+    try:
+        config = json.loads(run['config_snapshot'])
+        if runtime is None:
+            if not settings.llm_api_key.get_secret_value() or not config.get('llm_model'):
+                store.finish_run(run, error_code='configuration_required')
+                return
+            runtime = DataAgentRuntime(settings.model_copy(update=config))
+        memory = get_memory(store, run['user_id'])
+        with store.transaction() as conn:
+            if not store.fence(conn, run):
+                return
+            store.runs.set_memory_revision(conn, run['id'], memory['revision'])
+        enabled = store.enabled_skills(run['user_id'])
+        skills = [s for s in json.loads(run['skills_snapshot']) if enabled.get(s['name'], True)]
+
+        mcp_tools = _resolve_mcp_tools(mcp_gateway, store)
+
+        reply = runtime.respond(
+            messages=prompt_messages(store, run), memories=memory['entries'], skills=skills,
+            tool_handler=lambda name, args: _tool(store, run, name, args),
+            cancelled=lambda: _cancelled(store, run),
+            on_event=_step_recorder(store, run),
+            mcp_tools=mcp_tools)
+        if not isinstance(reply, str) or not reply.strip() or len(reply) > 64000:
+            raise ValueError('Invalid runtime reply')
+        store.finish_run(run, reply)
+        logger.info('Run %s succeeded in %.1fs (thread=%s)', run['id'], time.time() - started,
+                   threading.current_thread().name)
+    except Exception:
+        logger.error('Run %s failed after %.1fs (thread=%s)', run['id'], time.time() - started,
+                    threading.current_thread().name, exc_info=True)
+        store.finish_run(run, error_code='execution_failed')
+    finally:
+        stop.set()
+        thread.join(timeout=2)
+
+
+def _heartbeat_loop(store: Store, run: dict, lease_seconds: int, stop: threading.Event) -> None:
+    while not stop.wait(max(1, lease_seconds / 3)):
+        try:
+            if not store.heartbeat(run, lease_seconds):
+                return
+        except Exception:
+            logger.warning('Heartbeat failed for run %s', run['id'])
+            return
+
+
+def _cancelled(store: Store, run: dict) -> bool:
+    with store.transaction(immediate=False) as conn:
+        return not store.fence(conn, run)
+
+
+def _tool(store: Store, run: dict, name: str, args: dict):
+    if _cancelled(store, run):
+        raise ServiceError(409, 'Run is no longer active')
+    snapshot = json.loads(run['skills_snapshot'])
+    enabled = store.enabled_skills(run['user_id'])
+    if any(not enabled.get(skill['name'], True) for skill in snapshot):
+        raise ServiceError(403, 'Skill was disabled during execution')
+    if name == 'search_history':
+        return search_history(store, run, args)
+    raise ServiceError(403, 'Tool is not available')
+
+
+def _step_recorder(store: Store, run: dict):
+    seq = 0
+
+    def on_event(event: dict) -> None:
+        nonlocal seq
+        seq += 1
+        if event['kind'] == 'tool_call':
+            logger.info('Run %s tool %s(%s)', run['id'], event['name'], event['content'][:200])
+        try:
+            store.append_step(run['id'], seq, event, time.time())
+        except Exception:
+            logger.warning('Step persist failed for run %s seq %s', run['id'], seq)
+
+    return on_event
+
+
+def _resolve_mcp_tools(mcp_gateway: McpGateway | None, store: Store) -> list:
+    if mcp_gateway is not None:
+        try:
+            return mcp_gateway.tool_definitions()
+        except Exception:
+            logger.warning('MCP tool discovery failed')
+    return []
+
+
 class Worker:
+    """Durable worker that claims queued runs and executes them with heartbeat fencing.
+
+    Use `run_forever()` for the long-lived process loop. Tests inject `runtime=`
+    and `mcp_gateway=` to bypass real LLM / MCP calls.
+    """
+
     def __init__(self, settings: Settings, *, runtime: Any = None,
                  mcp_gateway: McpGateway | None = None):
         self.settings = settings
@@ -27,123 +147,24 @@ class Worker:
         self.runtime = runtime
         self._mcp_gateway = mcp_gateway
 
-    def _mcp_tools(self) -> list:
-        """MCP tool definitions for the live configuration; injected gateways
-        (tests) and fake runtimes keep this path controllable."""
-        if self.runtime is not None and self._mcp_gateway is None:
-            return []
-        if self._mcp_gateway is None:
-            self._mcp_gateway = McpGateway(self.store)
-        try:
-            return self._mcp_gateway.tool_definitions()
-        except Exception:
-            logger.warning('MCP tool discovery failed')
-            return []
-
-    def _runtime(self, run: dict | None = None):
-        if self.runtime is not None:
-            return self.runtime
-        config = json.loads(run['config_snapshot']) if run else {}
-        return DataAgentRuntime(self.settings.model_copy(update=config))
-
-    def _cancelled(self, run: dict) -> bool:
-        with self.store.transaction(immediate=False) as conn:
-            return not self.store.fence(conn, run)
-
-    def _tool(self, run: dict, name: str, args: dict):
-        if self._cancelled(run):
-            raise ServiceError(409, 'Run is no longer active')
-        snapshot = json.loads(run['skills_snapshot'])
-        enabled = self.store.enabled_skills(run['user_id'])
-        # Revoking any skill used by this run invalidates further tool dispatch.
-        if any(not enabled.get(skill['name'], True) for skill in snapshot):
-            raise ServiceError(403, 'Skill was disabled during execution')
-        if name == 'search_history':
-            return search_history(self.store, run, args)
-        raise ServiceError(403, 'Tool is not available')
-
-    def _heartbeat_loop(self, run: dict, stop: threading.Event) -> None:
-        while not stop.wait(max(1, self.settings.lease_seconds / 3)):
-            try:
-                if not self.store.heartbeat(run, self.settings.lease_seconds):
-                    return
-            except Exception:
-                logger.warning('Heartbeat failed for run %s', run['id'])
-                return
-
-    def _step_recorder(self, run: dict):
-        """Persist each runtime event as a run_step; trace failures never break the run."""
-        seq = 0
-
-        def on_event(event: dict) -> None:
-            nonlocal seq
-            seq += 1
-            if event['kind'] == 'tool_call':
-                logger.info('Run %s tool %s(%s)', run['id'], event['name'], event['content'][:200])
-            try:
-                self.store.append_step(run['id'], seq, event, time.time())
-            except Exception:
-                logger.warning('Step persist failed for run %s seq %s', run['id'], seq)
-
-        return on_event
-
     def run_once(self) -> bool:
+        """Claim and execute a single run synchronously (used in tests)."""
         run = self.store.claim_run(self.owner, self.settings.lease_seconds)
         if run is None:
             return False
-        started = time.time()
-        logger.info('Run %s claimed (model %s)', run['id'],
-                    json.loads(run['config_snapshot']).get('llm_model'))
-        stop = threading.Event()
-        thread = threading.Thread(target=self._heartbeat_loop, args=(run, stop), daemon=True)
-        thread.start()
-        try:
-            if self.runtime is None and (not self.settings.llm_api_key.get_secret_value()
-                                         or not json.loads(run['config_snapshot'])['llm_model']):
-                self.store.finish_run(run, error_code='configuration_required')
-                return True
-            memory = get_memory(self.store, run['user_id'])
-            with self.store.transaction() as conn:
-                if not self.store.fence(conn, run):
-                    return True
-                self.store.runs.set_memory_revision(conn, run['id'], memory['revision'])
-            enabled = self.store.enabled_skills(run['user_id'])
-            skills = [s for s in json.loads(run['skills_snapshot']) if enabled.get(s['name'], True)]
-            reply = self._runtime(run).respond(
-                messages=prompt_messages(self.store, run), memories=memory['entries'], skills=skills,
-                tool_handler=lambda name, args: self._tool(run, name, args),
-                cancelled=lambda: self._cancelled(run), on_event=self._step_recorder(run),
-                mcp_tools=self._mcp_tools())
-            if not isinstance(reply, str) or not reply.strip() or len(reply) > 64000:
-                raise ValueError('Invalid runtime reply')
-            self.store.finish_run(run, reply)
-            logger.info('Run %s succeeded in %.1fs', run['id'], time.time() - started)
-        except Exception:
-            logger.error('Run %s failed after %.1fs', run['id'], time.time() - started, exc_info=True)
-            self.store.finish_run(run, error_code='execution_failed')
-        finally:
-            stop.set()
-            thread.join(timeout=2)
+        _execute_with_store(self.store, self.settings, run, self.owner,
+                           runtime=self.runtime, mcp_gateway=self._mcp_gateway)
         return True
 
     def memory_once(self) -> bool:
-        if self.runtime is None and (not self.settings.llm_api_key.get_secret_value() or not self.settings.llm_model):
+        if self.runtime is not None:
+            return compress_one(self.store, self.runtime)
+        if not self.settings.llm_api_key.get_secret_value() or not self.settings.llm_model:
             return False
-        return compress_one(self.store, self._runtime())
-
-    def run_forever(self) -> None:
-        self.store.check_schema()
-        logger.info('Worker started (owner=%s poll=%ss lease=%ss)',
-                   self.owner, self.settings.poll_seconds, self.settings.lease_seconds)
-        while True:
-            worked = self.run_once()
-            worked = self.memory_once() or worked
-            worked = self.deliver_once() or worked
-            if not worked:
-                time.sleep(self.settings.poll_seconds)
+        config = {'llm_model': self.settings.llm_model}
+        return compress_one(self.store, DataAgentRuntime(self.settings.model_copy(update=config)))
 
     def deliver_once(self) -> bool:
-        """Send due Feishu replies and data deliveries; never re-executes a Run."""
         if not self.settings.feishu_app_id or not self.settings.feishu_app_secret.get_secret_value():
             return False
         secret = self.settings.feishu_app_secret.get_secret_value()
@@ -152,5 +173,45 @@ class Worker:
                                 owner=self.owner, lease_seconds=self.settings.lease_seconds)
                 + process_deliveries(self.store, sender, app_id=self.settings.feishu_app_id, app_secret=secret,
                                      owner=self.owner, lease_seconds=self.settings.lease_seconds))
-        logger.info('Feishu delivery pump sent %s row(s)', sent)
+        if sent:
+            logger.info('Feishu delivery pump sent %s row(s)', sent)
         return sent > 0
+
+    def run_forever(self) -> None:
+        """Main loop: claim runs on the main thread, execute in a thread pool,
+        and interleave memory extraction and Feishu delivery."""
+        self.store.check_schema()
+        concurrency = self.settings.worker_concurrency
+        logger.info('Worker started (owner=%s poll=%ss lease=%ss concurrency=%s backend=%s)',
+                   self.owner, self.settings.poll_seconds, self.settings.lease_seconds,
+                   concurrency, 'postgresql' if not self.store.db.is_sqlite else 'sqlite')
+
+        with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix='agent') as pool:
+            futures: dict[Any, dict] = {}  # future -> run
+            while True:
+                # Reap completed futures
+                done = [f for f in futures if f.done()]
+                for f in done:
+                    run = futures.pop(f)
+                    try:
+                        f.result()
+                    except Exception:
+                        logger.error('Run %s raised unhandled exception', run['id'], exc_info=True)
+
+                # Claim and submit until pool is full
+                while len(futures) < concurrency:
+                    run = self.store.claim_run(self.owner, self.settings.lease_seconds)
+                    if run is None:
+                        break
+                    future = pool.submit(_execute, self.settings, run, self.owner, self._mcp_gateway)
+                    futures[future] = run
+
+                # Background work
+                worked = self.memory_once()
+                worked = self.deliver_once() or worked
+
+                if not futures and not worked:
+                    time.sleep(self.settings.poll_seconds)
+
+    def close(self) -> None:
+        self.store.dispose()
