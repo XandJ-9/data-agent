@@ -25,6 +25,8 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 
+from clock import now_iso
+
 from lark_oapi.core.model import RawRequest
 from lark_oapi.event.custom import CustomizedEvent
 from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
@@ -259,7 +261,7 @@ class FeishuModule:
 
     def _record_event(self, conn, tenant_id: str, event_id: str, message_id: str) -> None:
         self.store.feishu.record_event(conn, self.settings.feishu_app_id, tenant_id, event_id,
-                                       message_id or None, self._now())
+                                       message_id or None, now_iso())
 
     def _dispatch(self, conn, tenant_id: str, open_id: str, sender: dict, body: dict,
                   event_id: str) -> str | None:
@@ -307,7 +309,7 @@ class FeishuModule:
             return self._enqueue_reply(conn, tenant_id, open_id, REPLY_HELP)
         if command == '/new':
             session_id = identifier()
-            self.store.sessions.create(conn, session_id, binding['user_id'], 'Feishu conversation', self._now())
+            self.store.sessions.create(conn, session_id, binding['user_id'], 'Feishu conversation', now_iso())
             self.store.channels.set_session(conn, binding['id'], session_id)
             return self._enqueue_reply(conn, tenant_id, open_id, REPLY_SESSION_SWITCHED)
         if command == '/switch':
@@ -327,7 +329,7 @@ class FeishuModule:
         """Bounded attempt counter keyed by the verified external identity."""
         key = f'{self.settings.feishu_app_id}:{tenant_id}:{open_id}'
         return self.store.feishu.bind_attempt_allowed(conn, key, self.bind_window_seconds,
-                                                      self.bind_max_attempts, self._now())
+                                                      self.bind_max_attempts, now_iso())
 
     def _consume_code(self, conn, code_hash: str, tenant_id: str, open_id: str) -> dict:
         """Shared binding logic (Store.consume_binding_code_conn) in the caller's transaction."""
@@ -355,7 +357,7 @@ class FeishuModule:
     def _enqueue_reply(self, conn, tenant_id: str, open_id: str, content: str) -> str:
         reply_id = identifier()
         self.store.feishu.enqueue_reply(conn, reply_id, self.settings.feishu_app_id, tenant_id, open_id,
-                                        content, f'rp-{reply_id}', self._now())
+                                        content, f'rp-{reply_id}', now_iso())
         return content
 
     def _binding(self, conn, tenant_id: str, open_id: str) -> dict | None:

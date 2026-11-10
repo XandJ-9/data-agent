@@ -1,4 +1,5 @@
 import time
+from clock import now_iso, now_plus
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -91,7 +92,7 @@ def test_cancel_and_expired_worker_cannot_commit(env):
     enqueue(settings, store, user, sid, key='second')
     run = store.claim_run('old', 120)
     with store.transaction() as conn:
-        sql(conn, 'UPDATE runs SET lease_until=? WHERE id=?', time.time() - 1, run['id'])
+        sql(conn, 'UPDATE runs SET lease_until=? WHERE id=?', now_plus(-1), run['id'])
     assert store.claim_run('new', 120) is None
     assert store.get_run(user['id'], run['id'])['status'] == 'interrupted'
     assert not store.finish_run(run, 'late')
@@ -259,7 +260,7 @@ def test_feishu_binding_hooks_and_delivery(env):
     code = 'binding-secret'
     with store.transaction() as conn:
         sql(conn, 'INSERT INTO binding_codes(code_hash,user_id,expires_at) VALUES(?,?,?)',
-            hashlib.sha256(code.encode()).hexdigest(), user['id'], time.time() + 600)
+            hashlib.sha256(code.encode()).hexdigest(), user['id'], now_plus(600))
     identity = store.consume_binding_code(hashlib.sha256(code.encode()).hexdigest(), 'app', 'tenant', 'ext-1')
     assert identity['user_id'] == user['id']
     with pytest.raises(ServiceError):
@@ -326,7 +327,7 @@ def test_archived_session_rejects_feishu_switch(env):
     code = 'switch-secret'
     with store.transaction() as conn:
         sql(conn, 'INSERT INTO binding_codes(code_hash,user_id,expires_at) VALUES(?,?,?)',
-            hashlib.sha256(code.encode()).hexdigest(), user['id'], time.time() + 600)
+            hashlib.sha256(code.encode()).hexdigest(), user['id'], now_plus(600))
     store.consume_binding_code(hashlib.sha256(code.encode()).hexdigest(), 'app2', 't2', 'ext-sw')
     assert client.put('/api/v1/bindings/feishu/session', json={'session_id': sid}).status_code == 409
 

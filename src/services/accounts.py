@@ -1,7 +1,7 @@
 """Account use cases: local accounts and opaque, hashed server-side browser sessions."""
 import hashlib
 import secrets
-import time
+from clock import now_iso, now_plus
 
 from argon2 import PasswordHasher
 from argon2.exceptions import VerificationError
@@ -45,11 +45,11 @@ def set_admin(store: Store, username: str, admin: bool = True) -> dict:
 
 
 def login(store: Store, username: str, password: str, seconds: int, peer: str) -> tuple[str, dict]:
-    now = time.time()
+    now = now_iso()
     # Both account and source counters prevent distributed guessing and account spraying.
     keys = [digest('account:' + username), digest('peer:' + peer)]
     with store.transaction() as conn:
-        store.accounts.purge_expired_attempts(conn, now - 300)
+        store.accounts.purge_expired_attempts(conn, now_plus(-300))
         for key in sorted(keys):
             if not store.accounts.record_attempt(conn, key, now):
                 raise ServiceError(429, 'Too many login attempts; try again later')
@@ -63,7 +63,7 @@ def login(store: Store, username: str, password: str, seconds: int, peer: str) -
     token, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
     with store.transaction() as conn:
         store.accounts.purge_expired_sessions(conn, now)
-        store.accounts.insert_session(conn, digest(token), row['id'], csrf, now + seconds)
+        store.accounts.insert_session(conn, digest(token), row['id'], csrf, now_plus(seconds))
         admin = store.accounts.is_admin(conn, row['id'])
     return token, {'user': {'id': row['id'], 'username': row['username']},
                    'csrf_token': csrf, 'is_admin': admin}
@@ -73,7 +73,7 @@ def authenticate(store: Store, token: str | None) -> dict:
     if not token:
         raise ServiceError(401, 'Authentication required')
     with store.transaction(immediate=False) as conn:
-        row = store.accounts.identity_by_token(conn, digest(token), time.time())
+        row = store.accounts.identity_by_token(conn, digest(token), now_iso())
     if row is None:
         raise ServiceError(401, 'Authentication required')
     return {'user': {'id': row['id'], 'username': row['username']},

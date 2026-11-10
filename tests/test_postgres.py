@@ -1,5 +1,6 @@
 """Real PostgreSQL READ COMMITTED regressions; opt in with --run-postgres."""
 import time
+from clock import SENTINEL, now_iso, now_plus
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 
@@ -48,7 +49,7 @@ def test_pg_schema_fks_defaults_and_precision(env):
     assert any(fk['referred_table'] == 'messages' for fk in inspector.get_foreign_keys('runs'))
     assert any(fk['referred_table'] == 'runs' for fk in inspector.get_foreign_keys('messages'))
     with store.transaction() as conn:
-        stamp = time.time()
+        stamp = now_iso()
         conn.execute(runs.insert().values(id='precision', user_id=user['id'],
                      session_id=store.sessions.create(conn, 'sid', user['id'], 'test', stamp)['id'],
                      client_message_id='one', created_at=stamp, definition_hash='hash',
@@ -77,7 +78,7 @@ def test_pg_parallel_login_attempts_are_bounded(env):
 
     def attempt(_):
         with store.transaction() as conn:
-            return store.accounts.record_attempt(conn, 'shared', time.time())
+            return store.accounts.record_attempt(conn, 'shared', now_iso())
 
     with ThreadPoolExecutor(8) as pool:
         accepted = list(pool.map(attempt, range(40)))
@@ -118,13 +119,13 @@ def test_pg_parallel_extraction_cas_preserves_losing_cursor(env):
     with store.transaction() as conn:
         rows = [store.sessions.own_session(conn, user['id'], sid) for sid in session_ids]
         assert sum(row['memory_cursor'] > 0 for row in rows) == 1
-        assert all(row['memory_retry_at'] == 0 for row in rows)
+        assert all(row['memory_retry_at'] == SENTINEL for row in rows)
 
 
 def test_pg_binding_conflict_does_not_burn_code(env):
     _, store, user, other = env
     for index, account in enumerate((user, other)):
-        store.create_binding_code(account['id'], str(index), time.time() + 600)
+        store.create_binding_code(account['id'], str(index), now_plus(600))
 
     def bind(index):
         with store.transaction() as conn:
@@ -135,7 +136,7 @@ def test_pg_binding_conflict_does_not_burn_code(env):
                 # Savepoint must keep both the code and outer transaction usable.
                 assert conn.execute(select(binding_codes.c.consumed_at).where(
                     binding_codes.c.code_hash == str(index))).scalar_one() is None
-                store.sessions.create(conn, f'outer-{index}', (user, other)[index]['id'], 'outer', time.time())
+                store.sessions.create(conn, f'outer-{index}', (user, other)[index]['id'], 'outer', now_iso())
                 return index, exc.status
 
     results = race(bind, 2)
@@ -159,7 +160,7 @@ def test_pg_finish_cancel_race_has_no_partial_reply(env):
 
 def test_pg_outbox_claims_do_not_overlap(env):
     settings, store, user, _ = env
-    store.create_binding_code(user['id'], 'code', time.time() + 600)
+    store.create_binding_code(user['id'], 'code', now_plus(600))
     binding = store.consume_binding_code('code', 'app', 'tenant', 'external')
     for index in range(4):
         submit_message(store, settings, user['id'], binding['session_id'], 'hello', str(index),
@@ -167,7 +168,7 @@ def test_pg_outbox_claims_do_not_overlap(env):
         assert store.finish_run(store.claim_run('worker', 120), 'answer')
     def claim(index):
         with store.transaction() as conn:
-            return store.outbox_deliveries.claim_batch(conn, str(index), 60, time.time(), 1)
+            return store.outbox_deliveries.claim_batch(conn, str(index), 60, now_iso(), 1)
     claims = race(claim)
     ids = [row['id'] for batch in claims for row in batch]
     assert len(ids) == len(set(ids))
@@ -183,7 +184,7 @@ def test_pg_webhook_dedupes_across_instances(env):
     from channels.feishu.webhook import FeishuModule
 
     settings = settings.model_copy(update={'feishu_app_id': APP_ID})
-    store.create_binding_code(user['id'], 'code', time.time() + 600)
+    store.create_binding_code(user['id'], 'code', now_plus(600))
     store.consume_binding_code('code', APP_ID, TENANT, OPEN_ID)
     race(lambda index: FeishuModule(store, settings).ingest(make_event(f'event-{index}', 'message', 'hello')))
     with store.transaction() as conn:

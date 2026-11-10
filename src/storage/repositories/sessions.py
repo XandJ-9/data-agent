@@ -22,7 +22,7 @@ class SessionsRepository(BaseRepository):
             raise ServiceError(404, 'Session not found')
         return row
 
-    def create(self, conn, session_id: str, user_id: str, title: str, created_at: float) -> dict:
+    def create(self, conn, session_id: str, user_id: str, title: str, created_at: str) -> dict:
         conn.execute(sessions.insert(), {'id': session_id, 'user_id': user_id, 'title': title,
                                          'created_at': created_at})
         return {'id': session_id, 'title': title, 'created_at': created_at}
@@ -48,7 +48,7 @@ class SessionsRepository(BaseRepository):
             raise ServiceError(404, 'Session not found')
         return row
 
-    def set_archived(self, conn, user_id: str, session_id: str, archived_at: float | None) -> dict:
+    def set_archived(self, conn, user_id: str, session_id: str, archived_at: str | None) -> dict:
         row = self._row(conn.execute(
             update(sessions).where(sessions.c.id == session_id, sessions.c.user_id == user_id)
             .values(archived_at=archived_at).returning(sessions)))

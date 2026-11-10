@@ -1,9 +1,10 @@
-"""Management CLI: init-db, create-user, worker and serve. No public registration."""
+"""Management CLI: init-db, create-user, worker, serve, dev."""
 import argparse
 import getpass
 import logging
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 
 import uvicorn
 
@@ -43,19 +44,20 @@ def main() -> int:
     logging.basicConfig(level=settings.log_level.upper(),
                         format='%(asctime)s %(levelname)s %(name)s %(message)s')
     parser = argparse.ArgumentParser(description='Data Agent service')
-    parser.add_argument('command', choices=['init-db', 'create-user', 'set-admin', 'worker', 'serve'])
+    parser.add_argument('command', choices=['init-db', 'create-user', 'set-admin', 'worker', 'serve', 'dev'])
     parser.add_argument('username', nargs='?')
     parser.add_argument('--admin', action='store_true', help='grant the new user admin rights')
     args = parser.parse_args()
     store = Store(settings.resolved_database_url)
     try:
+        cmd = Command(settings, store)
         if args.command == 'init-db':
-            Command(settings, store).init_db()
+            cmd.init_db()
         elif args.command == 'create-user':
             if not args.username:
                 parser.error('create-user requires a username')
             store.check_schema()
-            Command(settings, store).create_user(args.username, admin=args.admin)
+            cmd.create_user(args.username, admin=args.admin)
         elif args.command == 'set-admin':
             if not args.username:
                 parser.error('set-admin requires a username')
@@ -64,6 +66,9 @@ def main() -> int:
             print(f"{result['username']} admin={result['is_admin']}")
         elif args.command == 'worker':
             Worker(settings).run_forever()
+        elif args.command == 'dev':
+            uvicorn.run(create_app(settings), host=settings.host, port=settings.port,
+                        reload=True, reload_dirs=[str(Path(__file__).resolve().parent)])
         else:
             uvicorn.run(create_app(settings), host=settings.host, port=settings.port)
     except KeyboardInterrupt:

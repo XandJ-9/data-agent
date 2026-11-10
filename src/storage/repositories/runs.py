@@ -4,7 +4,7 @@ Single-repo conveniences (one transaction) live on the Store facade; composite
 lifecycle transitions (finish_run composing messages/outbox/memory) are also
 facade methods because they span repos inside one transaction.
 """
-import time
+from clock import now_iso, now_plus
 
 from sqlalchemy import exists, func, select, update
 from sqlalchemy.engine import Connection
@@ -66,7 +66,7 @@ class RunsRepository(BaseRepository):
                             runs.c.status.in_(['queued', 'running']))
                      .values(status='cancelled', generation=runs.c.generation + 1))
 
-    def claim(self, conn: Connection, owner: str, lease_seconds: int, now: float) -> dict | None:
+    def claim(self, conn: Connection, owner: str, lease_seconds: int, now: str) -> dict | None:
         conn.execute(update(runs)
                      .where(runs.c.status == 'running', runs.c.lease_until <= now)
                      .values(status='interrupted', error_code='worker_lost', generation=runs.c.generation + 1))
@@ -92,7 +92,7 @@ class RunsRepository(BaseRepository):
                     (prev.c.status == 'running') | ((prev.c.status == 'queued') &
                     (prev.c.input_message_id < runs.c.input_message_id)))))
             .values(status='running', owner=owner, generation=runs.c.generation + 1,
-                    lease_until=now + lease_seconds)
+                    lease_until=now_plus(lease_seconds))
             .returning(runs)).mappings().first()
         return dict(row) if row is not None else None
 
@@ -101,18 +101,18 @@ class RunsRepository(BaseRepository):
         return conn.execute(
             select(1).select_from(runs).where(
                 runs.c.id == run['id'], runs.c.status == 'running', runs.c.owner == run['owner'],
-                runs.c.generation == run['generation'], runs.c.lease_until > time.time())
+                runs.c.generation == run['generation'], runs.c.lease_until > now_iso())
         ).first() is not None
 
     @staticmethod
     def _fenced_update(run: dict):
         return update(runs).where(
             runs.c.id == run['id'], runs.c.status == 'running', runs.c.owner == run['owner'],
-            runs.c.generation == run['generation'], runs.c.lease_until > time.time())
+            runs.c.generation == run['generation'], runs.c.lease_until > now_iso())
 
     def heartbeat(self, conn: Connection, run: dict, lease_seconds: int) -> bool:
         return conn.execute(self._fenced_update(run)
-                            .values(lease_until=time.time() + lease_seconds)
+                            .values(lease_until=now_plus(lease_seconds))
                             .returning(runs.c.id)).first() is not None
 
     def mark_finished(self, conn: Connection, run: dict, error_code: str | None) -> bool:

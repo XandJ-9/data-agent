@@ -2,7 +2,7 @@
 import json
 import logging
 import re
-import time
+from clock import now_iso, now_plus
 
 from errors import ServiceError
 from ids import identifier
@@ -36,7 +36,7 @@ def validate_entries(store: Store, conn, user_id: str, entries: list[dict]) -> l
             if not store.messages_repo.exists_for_user(conn, source, user_id):
                 raise ServiceError(400, 'Invalid memory source')
         clean.append({'id': eid, 'text': text.strip(), 'source_message_ids': sorted(set(sources)),
-                      'updated_at': time.time()})
+                      'updated_at': now_iso()})
     if len({e['id'] for e in clean}) != len(clean):
         raise ServiceError(400, 'Duplicate memory entry IDs')
     return clean
@@ -72,7 +72,7 @@ def forget_memory(store: Store, user_id: str, expected_revision: int, entry_id: 
 
 def _batch(store: Store) -> dict | None:
     with store.transaction() as conn:
-        row = store.memory.claim_batch(conn, time.time())
+        row = store.memory.claim_batch(conn, now_iso())
         if row is None:
             return None
         rounds = store.runs.memory_rounds(conn, row['id'], row['memory_cursor'])
@@ -98,7 +98,7 @@ def _batch(store: Store) -> dict | None:
             pair = messages[index:index + 2]
             if len(pair) == 2 and not any(m['id'] in excluded for m in pair):
                 allowed += pair
-        claim = time.time() + 300
+        claim = now_plus(300)
         if not store.memory.set_claim(conn, row['id'], claim, row['memory_retry_at']):
             return None
         return {**row, 'messages': allowed, 'end': end, 'claim': claim}
@@ -152,7 +152,7 @@ def compress_one(store: Store, runtime) -> bool:
         return True
     except Exception:
         logger.warning('Memory extraction failed for session %s', batch['id'])
-        backoff = time.time() + min(3600, 5 * 2 ** min(batch['memory_failures'], 9))
+        backoff = now_plus(min(3600, 5 * 2 ** min(batch['memory_failures'], 9)))
         with store.transaction() as conn:
             store.memory.register_failure(conn, batch['id'], 'memory_extraction_failed', backoff, batch['claim'])
         return False

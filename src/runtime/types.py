@@ -3,6 +3,7 @@
 These are the only types the reusable loop and its providers share; keeping
 them free of any SDK, settings or storage import preserves core independence.
 """
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -15,6 +16,7 @@ class RuntimeConfig:
     max_tokens: int = 4096
     context_tokens: int = 24000
     max_tool_rounds: int = 8
+    max_reference_memories: int = 20  # max memory entries injected into the context
 
 
 @dataclass(frozen=True)
@@ -31,6 +33,8 @@ class ModelReply:
     content: str | None
     tool_calls: tuple[ToolCall, ...] = ()
     reasoning: str | None = None  # thinking trace when the model exposes one
+    prompt_tokens: int = 0        # actual tokens consumed by the input (from API usage)
+    completion_tokens: int = 0    # actual tokens generated for the output
 
 
 class RuntimeFailure(Exception):
@@ -45,3 +49,7 @@ class ModelProvider(Protocol):
     """Model transport injected into the runtime; raises RuntimeFailure on errors."""
 
     def complete(self, config: RuntimeConfig, messages: list[dict], tools: list[dict] | None) -> ModelReply: ...
+
+    def stream_complete(self, config: RuntimeConfig, messages: list[dict], tools: list[dict] | None,
+                        on_text: Callable[[str], None],
+                        on_reasoning: Callable[[str], None] | None = None) -> ModelReply: ...

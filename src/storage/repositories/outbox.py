@@ -1,7 +1,7 @@
 """Outbox rows for channel delivery (deliveries, feishu_replies): same state
 machine, parameterized by table. The pump claims with a conditional UPDATE
 (status guard + rowcount) so concurrent workers never double-claim."""
-import time
+from clock import now_iso, now_plus
 
 from sqlalchemy import select, update
 from sqlalchemy.engine import Connection
@@ -14,7 +14,7 @@ class OutboxRepository(BaseRepository):
         self.table = table
         self.order_column = order_column
 
-    def claim_batch(self, conn: Connection, owner: str, lease_seconds: int, now: float,
+    def claim_batch(self, conn: Connection, owner: str, lease_seconds: int, now: str,
                     limit: int) -> list[dict]:
         conn.execute(update(self.table)
                      .where(self.table.c.status == 'sending', self.table.c.lease_until <= now)
@@ -28,19 +28,19 @@ class OutboxRepository(BaseRepository):
                                   .where(self.table.c.id == row_id, self.table.c.status == 'pending')
                                   .values(status='sending', owner=owner,
                                           generation=self.table.c.generation + 1,
-                                          lease_until=now + lease_seconds))
+                                          lease_until=now_plus(lease_seconds)))
             if cursor.rowcount == 1:
                 claimed.append(self._row(conn.execute(select(self.table).where(self.table.c.id == row_id))))
         return claimed
 
     def finish(self, conn: Connection, row: dict, status: str, *, receipt: str | None = None,
-               error_code: str | None = None, retry_at: float = 0, now: float | None = None) -> bool:
+               error_code: str | None = None, retry_at: str = '1970-01-01 00:00:00.000000', now: str | None = None) -> bool:
         """Fenced transition out of 'sending'; a lost lease means another owner moved on."""
         cursor = conn.execute(update(self.table)
                               .where(self.table.c.id == row['id'], self.table.c.status == 'sending',
                                      self.table.c.owner == row['owner'],
                                      self.table.c.generation == row['generation'],
-                                     self.table.c.lease_until > (time.time() if now is None else now))
+                                     self.table.c.lease_until > (now_iso() if now is None else now))
                               .values(status=status, receipt=receipt, error_code=error_code,
                                       attempts=self.table.c.attempts + 1, retry_at=retry_at))
         return cursor.rowcount == 1
@@ -63,5 +63,5 @@ class OutboxRepository(BaseRepository):
 
     def reset_pending(self, conn: Connection, delivery_id: str) -> None:
         conn.execute(update(self.table).where(self.table.c.id == delivery_id)
-                     .values(status='pending', retry_at=0, error_code=None,
+                     .values(status='pending', retry_at="1970-01-01 00:00:00.000000", error_code=None,
                              generation=self.table.c.generation + 1))

@@ -1,12 +1,10 @@
-"""FastAPI application assembly: state, middleware, exception mapping, static workbench."""
+"""FastAPI application assembly: state, middleware, exception mapping."""
 import logging
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse
 from sqlalchemy.exc import SQLAlchemyError
 
 from api import routes
@@ -27,7 +25,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         logger.info('Starting Data Agent on %s:%s', settings.host, settings.port)
         try:
             store.check_schema()
-            logger.info('Schema validated (SQLite: %s)', store.db.is_sqlite)
+            logger.info('Database ready (backend: %s)', 'postgresql' if not store.db.is_sqlite else 'sqlite')
             yield
         finally:
             logger.info('Shutting down')
@@ -66,13 +64,5 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         response.headers['Referrer-Policy'] = 'same-origin'
         response.headers['Cache-Control'] = 'no-store'
         return response
-
-    web = Path(settings.web_dist)
-    if (web / 'assets').is_dir():
-        app.mount('/assets', StaticFiles(directory=web / 'assets'), name='assets')
-    if (web / 'index.html').is_file():
-        @app.get('/')
-        def index():
-            return FileResponse(web / 'index.html')
 
     return app

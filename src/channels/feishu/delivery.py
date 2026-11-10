@@ -21,6 +21,8 @@ import threading
 import time
 from collections.abc import Callable
 
+from clock import from_timestamp, now_iso, now_plus
+
 FEISHU_TEXT_LIMIT = 3000
 MAX_ATTEMPTS = 8
 BACKOFF_BASE = 2.0
@@ -80,16 +82,15 @@ def partition_reply(text: str, limit: int = FEISHU_TEXT_LIMIT) -> list[str]:
 def _claim_batch(store, outbox, owner: str, lease_seconds: int,
                  clock: Callable[[], float], limit: int) -> list[dict]:
     with store.transaction() as conn:
-        return outbox.claim_batch(conn, owner, lease_seconds, clock(), limit)
+        return outbox.claim_batch(conn, owner, lease_seconds, from_timestamp(clock()), limit)
 
 
 def _finish(store, outbox, row: dict, status: str, *, receipt: str | None = None,
-            error_code: str | None = None, retry_at: float = 0,
-            clock: Callable[[], float] = time.time) -> bool:
+            error_code: str | None = None, retry_at: str = '1970-01-01 00:00:00.000000') -> bool:
     """Fenced transition out of 'sending'; a lost lease means another owner moved on."""
     with store.transaction() as conn:
         return outbox.finish(conn, row, status, receipt=receipt, error_code=error_code,
-                             retry_at=retry_at, now=clock())
+                             retry_at=retry_at)
 
 
 def _binding_valid(store, binding_id: str, reply_target: str) -> bool:
@@ -99,8 +100,9 @@ def _binding_valid(store, binding_id: str, reply_target: str) -> bool:
     return row is not None and bool(row['active']) and row['external_user_id'] == reply_target
 
 
-def _backoff(attempts: int, clock: Callable[[], float]) -> float:
-    return clock() + min(BACKOFF_BASE ** max(attempts, 1), BACKOFF_CAP)
+def _backoff(attempts: int, clock: Callable[[], float]) -> str:
+    delay = min(BACKOFF_BASE ** max(attempts, 1), BACKOFF_CAP)
+    return from_timestamp(clock() + delay)
 
 
 def process_deliveries(store, sender, *, app_id: str, app_secret: str, owner: str = 'feishu-delivery',
@@ -111,7 +113,7 @@ def process_deliveries(store, sender, *, app_id: str, app_secret: str, owner: st
     sent = 0
     for row in claimed:
         if not _binding_valid(store, row['binding_id'], row['reply_target']):
-            if _finish(store, store.outbox_deliveries, row, 'failed', error_code='binding_revoked', clock=clock):
+            if _finish(store, store.outbox_deliveries, row, 'failed', error_code='binding_revoked'):
                 sent += 1
             continue
         parts = partition_reply(row['content'])
@@ -120,20 +122,20 @@ def process_deliveries(store, sender, *, app_id: str, app_secret: str, owner: st
             for index, part in enumerate(parts):
                 receipt = sender(app_id, app_secret, row['reply_target'], part, f"dl-{row['id']}:{index}")
         except DeliveryTimeout:
-            if _finish(store, store.outbox_deliveries, row, 'unknown', error_code='timeout', clock=clock):
+            if _finish(store, store.outbox_deliveries, row, 'unknown', error_code='timeout'):
                 sent += 1
             continue
         except DeliveryApiError as exc:
             attempts = row['attempts'] + 1
             if attempts >= MAX_ATTEMPTS:
-                done = _finish(store, store.outbox_deliveries, row, 'failed', error_code=exc.code, clock=clock)
+                done = _finish(store, store.outbox_deliveries, row, 'failed', error_code=exc.code)
             else:
                 done = _finish(store, store.outbox_deliveries, row, 'pending', error_code=exc.code,
-                               retry_at=_backoff(attempts, clock), clock=clock)
+                               retry_at=_backoff(attempts, clock))
             if done:
                 sent += 1
             continue
-        if _finish(store, store.outbox_deliveries, row, 'delivered', receipt=receipt, clock=clock):
+        if _finish(store, store.outbox_deliveries, row, 'delivered', receipt=receipt):
             sent += 1
     return sent
 
@@ -153,20 +155,20 @@ def process_replies(store, sender, *, app_id: str, app_secret: str, owner: str =
         try:
             receipt = sender(app_id, app_secret, row['reply_target'], row['content'], row['uuid'])
         except DeliveryTimeout:
-            if _finish(store, store.outbox_replies, row, 'unknown', error_code='timeout', clock=clock):
+            if _finish(store, store.outbox_replies, row, 'unknown', error_code='timeout'):
                 sent += 1
             continue
         except DeliveryApiError as exc:
             attempts = row['attempts'] + 1
             if attempts >= MAX_ATTEMPTS:
-                done = _finish(store, store.outbox_replies, row, 'failed', error_code=exc.code, clock=clock)
+                done = _finish(store, store.outbox_replies, row, 'failed', error_code=exc.code)
             else:
                 done = _finish(store, store.outbox_replies, row, 'pending', error_code=exc.code,
-                               retry_at=_backoff(attempts, clock), clock=clock)
+                               retry_at=_backoff(attempts, clock))
             if done:
                 sent += 1
             continue
-        if _finish(store, store.outbox_replies, row, 'delivered', receipt=receipt, clock=clock):
+        if _finish(store, store.outbox_replies, row, 'delivered', receipt=receipt):
             sent += 1
     return sent
 

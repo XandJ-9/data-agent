@@ -65,14 +65,36 @@ _start_fe() {
 case "$cmd" in
   start)
     _log "启动 data-agent…"
+    _log "初始化数据库…"
+    uv run data-agent init-db
     _start_serve
     sleep 1
     _start_worker
     _log "全部就绪"
     ;;
+  dev)
+    _log "启动开发模式（后端热加载 + 前端 HMR）…"
+    _log "初始化数据库…"
+    uv run data-agent init-db
+    # 后端使用 uvicorn --reload，监听 src/ 目录变更自动重启
+    if _running "$SERVE_PID"; then
+      _log "serve 已在运行 (pid=$(cat "$SERVE_PID"))"
+    else
+      mkdir -p "$PID_DIR" "$LOG_DIR"
+      nohup uv run data-agent dev >> "$SERVE_LOG" 2>&1 &
+      echo $! > "$SERVE_PID"
+      _log "serve 已启动（热加载模式，pid=$! 日志: $SERVE_LOG)"
+    fi
+    sleep 1
+    _start_worker
+    _start_fe
+    _log "开发模式就绪 · 后端热加载（src/） + 前端 HMR（web/src/）"
+    _log "使用 ./run.sh stop 停止所有服务"
+    ;;
   stop)
     _log "停止 data-agent…"
     _kill "$SERVE_PID" serve
+    pkill -f "data-agent dev" 2>/dev/null || true
     _kill "$WORKER_PID" worker
     ;;
   restart)
@@ -99,7 +121,7 @@ case "$cmd" in
     tail -f "$SERVE_LOG" "$WORKER_LOG"
     ;;
   *)
-    echo "用法: ./run.sh {start|stop|restart|status|logs|fe}"
+    echo "用法: ./run.sh {start|stop|restart|status|logs|fe|dev}"
     exit 1
     ;;
 esac

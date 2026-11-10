@@ -5,7 +5,7 @@ conveniences (one transaction each) and composites that must span several
 repos atomically (finish_run, consume_binding_code, retry_delivery).
 Method signatures are stable for services/api/channels/worker.
 """
-import time
+from clock import now_iso, now_plus
 
 from errors import ServiceError
 from ids import identifier
@@ -67,7 +67,7 @@ class Store:
         return self.sessions.own_session(conn, user_id, session_id)
 
     def create_session(self, user_id: str, title: str = 'New conversation') -> dict:
-        result = {'id': identifier(), 'title': title, 'created_at': time.time()}
+        result = {'id': identifier(), 'title': title, 'created_at': now_iso()}
         with self.transaction() as conn:
             self.sessions.create(conn, result['id'], user_id, title, result['created_at'])
         return result
@@ -83,7 +83,7 @@ class Store:
     def archive_session(self, user_id: str, session_id: str) -> dict:
         with self.transaction() as conn:
             self._check_archivable(conn, session_id)
-            return self.sessions.set_archived(conn, user_id, session_id, time.time())
+            return self.sessions.set_archived(conn, user_id, session_id, now_iso())
 
     def restore_session(self, user_id: str, session_id: str) -> dict:
         with self.transaction() as conn:
@@ -111,9 +111,8 @@ class Store:
         with self.transaction(immediate=False) as conn:
             self.sessions.own_session(conn, user_id, session_id)
             page, next_before = self.messages_repo.page(conn, session_id, before_id, limit)
-            run_ids = {r['run_id'] for r in page}
-            runs = [self._public_run(conn, r) for r in self.runs.by_session(conn, session_id)
-                    if r['id'] in run_ids]
+            # 返回会话里所有 run（含尚未关联消息的进行中 run），前端将在消息流中内联展示
+            runs = [self._public_run(conn, r) for r in self.runs.by_session(conn, session_id)]
             return {'items': page, 'runs': runs, 'next_before_id': next_before}
 
     def _public_run(self, conn, run: dict) -> dict:
@@ -129,7 +128,7 @@ class Store:
             self.runs.cancel(conn, user_id, run_id)
         return self.get_run(user_id, run_id)
 
-    def append_step(self, run_id: str, seq: int, event: dict, now: float) -> None:
+    def append_step(self, run_id: str, seq: int, event: dict, now: str) -> None:
         with self.transaction() as conn:
             self.run_steps.append(conn, run_id, seq, event, now)
 
@@ -141,7 +140,7 @@ class Store:
 
     def claim_run(self, owner: str, lease_seconds: int) -> dict | None:
         with self.transaction() as conn:
-            return self.runs.claim(conn, owner, lease_seconds, time.time())
+            return self.runs.claim(conn, owner, lease_seconds, now_iso())
 
     @staticmethod
     def fence(conn, run: dict) -> bool:
@@ -159,7 +158,7 @@ class Store:
             if error_code:
                 return True
             self.messages_repo.insert(conn, run['user_id'], run['session_id'], run['id'], 'assistant', content,
-                                      time.time())
+                                      now_iso())
             self.memory.mark_dirty(conn, run['session_id'])
             if run['source'] == 'feishu':
                 self.outbox_deliveries.enqueue(conn, {
@@ -184,13 +183,13 @@ class Store:
 
         try:
             with conn.begin_nested():
-                row = self.channels.consume_code(conn, code_hash, time.time())
+                row = self.channels.consume_code(conn, code_hash, now_iso())
                 if row is None:
                     raise ServiceError(400, 'Binding code invalid or expired')
                 if self.channels.active_conflict(conn, row['user_id'], app_id, tenant_id, external_user_id):
                     raise ServiceError(409, 'Account already bound')
                 sid, bid = identifier(), identifier()
-                self.sessions.create(conn, sid, row['user_id'], 'Feishu conversation', time.time())
+                self.sessions.create(conn, sid, row['user_id'], 'Feishu conversation', now_iso())
                 self.channels.create(conn, bid, row['user_id'], app_id, tenant_id, external_user_id, sid)
                 return self.channels.by_id(conn, bid)
         except IntegrityError:
@@ -226,7 +225,7 @@ class Store:
 
     # ------------------------------------------------------------ api-owned composites
 
-    def create_binding_code(self, user_id: str, code_hash: str, expires_at: float) -> None:
+    def create_binding_code(self, user_id: str, code_hash: str, expires_at: str) -> None:
         with self.transaction() as conn:
             self.channels.purge_codes(conn, user_id)
             self.channels.create_code(conn, code_hash, user_id, expires_at)

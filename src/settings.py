@@ -19,7 +19,7 @@ class Settings(BaseSettings):
 
     host: str = "127.0.0.1"
     port: int = 8100
-    public_origin: str = "http://localhost:8100"
+    public_origin: str = "http://127.0.0.1:8100"
     cookie_secure: bool = False
     session_seconds: int = Field(default=43200, ge=60)
     llm_api_key: SecretStr = SecretStr("")
@@ -34,7 +34,6 @@ class Settings(BaseSettings):
     worker_concurrency: int = Field(default=3, ge=1, le=20)
     log_level: str = 'INFO'
     skills_path: Path = Path(__file__).resolve().parent.parent / "skills"
-    web_dist: Path = Path("web/dist")
     feishu_app_id: str = ""
     feishu_app_secret: SecretStr = SecretStr("")
     feishu_verification_token: SecretStr = SecretStr("")

@@ -3,6 +3,7 @@
 from sqlalchemy import case, insert, select, update
 from sqlalchemy.engine import Connection
 
+from clock import SENTINEL
 from storage.repositories.base import BaseRepository
 from storage.schema import memory_exclusions, sessions, user_memories
 
@@ -43,7 +44,7 @@ class MemoryRepository(BaseRepository):
 
     # ------------------------------------------------------------ session claim fields
 
-    def claim_batch(self, conn: Connection, now: float) -> dict | None:
+    def claim_batch(self, conn: Connection, now: str) -> dict | None:
         """Oldest due dirty session joined with its memory row; claims it via retry_at."""
         row = conn.execute(
             select(sessions, user_memories.c.revision, user_memories.c.entries, user_memories.c.excluded_before)
@@ -61,26 +62,26 @@ class MemoryRepository(BaseRepository):
     def mark_dirty(self, conn: Connection, session_id: str) -> None:
         conn.execute(update(sessions).where(sessions.c.id == session_id).values(memory_dirty=1))
 
-    def set_claim(self, conn: Connection, session_id: str, claim: float, previous: float) -> bool:
+    def set_claim(self, conn: Connection, session_id: str, claim: str, previous: str) -> bool:
         return conn.execute(update(sessions).where(
             sessions.c.id == session_id, sessions.c.memory_dirty == 1,
             sessions.c.memory_retry_at == previous).values(memory_retry_at=claim)
             .returning(sessions.c.id)).first() is not None
 
-    def reset_claim(self, conn: Connection, session_id: str, claim: float) -> None:
+    def reset_claim(self, conn: Connection, session_id: str, claim: str) -> None:
         conn.execute(update(sessions)
                      .where(sessions.c.id == session_id, sessions.c.memory_retry_at == claim)
-                     .values(memory_retry_at=0))
+                     .values(memory_retry_at=SENTINEL))
 
-    def advance_cursor(self, conn: Connection, session_id: str, end: int, claim: float) -> None:
+    def advance_cursor(self, conn: Connection, session_id: str, end: int, claim: str) -> None:
         """Advance cursor and clear claim without touching memory entries (no new facts found)."""
         conn.execute(update(sessions)
                      .where(sessions.c.id == session_id, sessions.c.memory_retry_at == claim)
-                     .values(memory_cursor=end, memory_dirty=0, memory_retry_at=0,
+                     .values(memory_cursor=end, memory_dirty=0, memory_retry_at=SENTINEL,
                              memory_failures=0, memory_error=None))
 
     def apply_extraction(self, conn: Connection, session_id: str, user_id: str, entries_json: str,
-                         end: int, dirty: bool, *, revision: int, cursor: int, claim: float) -> bool:
+                         end: int, dirty: bool, *, revision: int, cursor: int, claim: str) -> bool:
         session = conn.execute(select(sessions.c.id).where(
             sessions.c.id == session_id, sessions.c.user_id == user_id,
             sessions.c.memory_cursor == cursor, sessions.c.memory_retry_at == claim)
@@ -88,12 +89,12 @@ class MemoryRepository(BaseRepository):
         if session is None or not self.bump_entries(conn, user_id, entries_json, revision):
             return False
         conn.execute(update(sessions).where(sessions.c.id == session_id)
-                     .values(memory_cursor=end, memory_dirty=int(dirty), memory_retry_at=0,
+                     .values(memory_cursor=end, memory_dirty=int(dirty), memory_retry_at=SENTINEL,
                              memory_failures=0, memory_error=None))
         return True
 
-    def register_failure(self, conn: Connection, session_id: str, error: str, retry_at: float,
-                         claim: float) -> None:
+    def register_failure(self, conn: Connection, session_id: str, error: str, retry_at: str,
+                         claim: str) -> None:
         conn.execute(update(sessions)
                      .where(sessions.c.id == session_id, sessions.c.memory_retry_at == claim)
                      .values(memory_failures=sessions.c.memory_failures + 1,

@@ -1,10 +1,12 @@
 """Browser API routes. All mutation requests require an exact trusted Origin."""
+import asyncio
 import json
 import shutil
-import time
+from clock import now_iso, now_plus
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, Query, Request, Response
+from starlette.responses import StreamingResponse
 
 from api import deps, schemas
 from channels.feishu.webhook import generate_code, sha256_hex
@@ -91,6 +93,27 @@ def send(session_id: str, data: schemas.Message, request: Request, identity: dic
 @router.get('/api/v1/runs/{run_id}')
 def run(run_id: str, identity: dict = Depends(deps.current), store=Depends(deps.store)):
     return store.get_run(identity['user']['id'], run_id)
+
+
+@router.get('/api/v1/runs/{run_id}/steps/stream')
+async def steps_stream(run_id: str, identity: dict = Depends(deps.current), store=Depends(deps.store)):
+    run = store.get_run(identity['user']['id'], run_id)  # ownership check
+
+    async def events():
+        seen = 0
+        while True:
+            current = store.get_run(identity['user']['id'], run_id)
+            steps = store.list_steps(run_id)['items']
+            for step in steps[seen:]:
+                yield f"data: {json.dumps(step, default=str)}\n\n"
+                seen += 1
+            if current['status'] not in ('queued', 'running'):
+                yield f"event: done\ndata: {json.dumps({'status': current['status']})}\n\n"
+                return
+            await asyncio.sleep(0.5)
+
+    return StreamingResponse(events(), media_type='text/event-stream',
+                             headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
 
 
 @router.get('/api/v1/runs/{run_id}/steps')
@@ -217,7 +240,7 @@ def mcp_servers(identity: dict = Depends(deps.current), store=Depends(deps.store
 def create_mcp_server(data: schemas.McpServerCreate, identity: dict = Depends(deps.current),
                       store=Depends(deps.store)):
     _require_admin(identity)
-    fields = {'id': identifier(), 'name': data.name, 'created_at': time.time(), **_mcp_fields(data)}
+    fields = {'id': identifier(), 'name': data.name, 'created_at': now_iso(), **_mcp_fields(data)}
     store.upsert_mcp_server(fields)
     return _public_mcp({'created_at': fields['created_at'], **fields})
 
@@ -229,8 +252,8 @@ def update_mcp_server(name: str, data: schemas.McpServerUpdate,
     if not any(row['name'] == name for row in store.list_mcp_servers()):
         raise ServiceError(404, 'Server not found')
     store.upsert_mcp_server({'id': identifier(), 'name': name,
-                             'created_at': time.time(), **_mcp_fields(data)})
-    return _public_mcp({'name': name, 'created_at': time.time(), **_mcp_fields(data)})
+                             'created_at': now_iso(), **_mcp_fields(data)})
+    return _public_mcp({'name': name, 'created_at': now_iso(), **_mcp_fields(data)})
 
 
 @router.delete('/api/v1/mcp/servers/{name}')
@@ -249,16 +272,17 @@ async def test_mcp_server(name: str, identity: dict = Depends(deps.current),
     row = next((r for r in store.list_mcp_servers() if r['name'] == name), None)
     if row is None:
         raise ServiceError(404, 'Server not found')
+    if not row['enabled']:
+        raise ServiceError(400, 'Server is disabled; enable it before testing')
     gateway = McpGateway(store)
     try:
-        definitions = gateway.tool_definitions(refresh=True)
-    except Exception:
-        raise ServiceError(502, 'Connection failed') from None
+        definitions = gateway.test_server(row)
+    except Exception as exc:
+        raise ServiceError(502, f'Connection failed: {exc}') from None
     finally:
         gateway.close()
     return {'name': name, 'tools': [
-        {'name': d.name, 'description': d.description} for d in definitions
-        if d.name.startswith(f'mcp_{name}_')]}
+        {'name': d.name, 'description': d.description} for d in definitions]}
 
 
 # ---------------------------------------------------------------- feishu binding
@@ -273,7 +297,7 @@ def binding(request: Request, identity: dict = Depends(deps.current)):
 
 @router.post('/api/v1/bindings/feishu/codes')
 def binding_code(identity: dict = Depends(deps.current), store=Depends(deps.store)):
-    code, expires = generate_code(), time.time() + 600
+    code, expires = generate_code(), now_plus(600)
     store.create_binding_code(identity['user']['id'], sha256_hex(code), expires)
     return {'code': code, 'expires_at': expires}
 

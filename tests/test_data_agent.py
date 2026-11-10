@@ -39,11 +39,49 @@ def tool(name: str, arguments: Any, call_id: str = "call-1") -> SimpleNamespace:
     )
 
 
+def _to_stream_chunks(response: SimpleNamespace) -> list[SimpleNamespace]:
+    """Convert a non-streaming response into a sequence of stream chunks.
+    Character-by-character text; tool calls in a single chunk each."""
+    choice = response.choices[0]
+    message = choice.message
+    chunks: list[SimpleNamespace] = []
+    content = message.content or ''
+    for char in content:
+        chunks.append(SimpleNamespace(
+            choices=[SimpleNamespace(
+                delta=SimpleNamespace(content=char, reasoning_content=None, tool_calls=None),
+                finish_reason=None)]))
+    if message.tool_calls:
+        for i, tc in enumerate(message.tool_calls):
+            chunks.append(SimpleNamespace(
+                choices=[SimpleNamespace(
+                    delta=SimpleNamespace(
+                        content=None, reasoning_content=None,
+                        tool_calls=[SimpleNamespace(
+                            index=i, id=tc.id,
+                            function=SimpleNamespace(name=tc.function.name, arguments=tc.function.arguments))]),
+                    finish_reason=None)]))
+    chunks.append(SimpleNamespace(
+        choices=[SimpleNamespace(
+            delta=SimpleNamespace(content=None, reasoning_content=None, tool_calls=None),
+            finish_reason=choice.finish_reason)]))
+    return chunks
+
+
 def client_for(*responses: Any) -> SimpleNamespace:
+    idx = [0]
+
+    def create(**kwargs: Any) -> Any:
+        resp = responses[idx[0]]
+        idx[0] += 1
+        if kwargs.get('stream'):
+            return iter(_to_stream_chunks(resp))
+        return resp
+
     return SimpleNamespace(
         chat=SimpleNamespace(
             completions=SimpleNamespace(
-                create=Mock(side_effect=responses),
+                create=Mock(side_effect=create),
             )
         )
     )

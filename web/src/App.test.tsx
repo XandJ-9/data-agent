@@ -97,7 +97,10 @@ it('keeps the newly selected session when a stale poll resolves late', async () 
 it('cancels a running run and reflects the terminal status', async () => {
   loginResponses();
   set('/sessions/s1/messages', {
-    items: [{ id: 1, role: 'user', content: '分析销量', created_at: '2026-01-01T00:00:00Z', run_id: 'r1' }],
+    items: [
+      { id: 1, role: 'user', content: '分析销量', created_at: '2026-01-01T00:00:00Z', run_id: null },
+      { id: 2, role: 'assistant', content: '分析中…', created_at: '2026-01-01T00:00:01Z', run_id: 'r1' },
+    ],
     runs: [{ id: 'r1', status: 'running', error_code: null, created_at: '2026-01-01T00:00:00Z', deliveries: [] }],
     next_before_id: null,
   });
@@ -107,7 +110,10 @@ it('cancels a running run and reflects the terminal status', async () => {
   const cancel = await screen.findByRole('button', { name: '取消执行' });
   expect(screen.getByText('执行中')).toBeInTheDocument();
   set('/sessions/s1/messages', {
-    items: [{ id: 1, role: 'user', content: '分析销量', created_at: '2026-01-01T00:00:00Z', run_id: 'r1' }],
+    items: [
+      { id: 1, role: 'user', content: '分析销量', created_at: '2026-01-01T00:00:00Z', run_id: null },
+      { id: 2, role: 'assistant', content: '分析中…', created_at: '2026-01-01T00:00:01Z', run_id: 'r1' },
+    ],
     runs: [{ id: 'r1', status: 'cancelled', error_code: null, created_at: '2026-01-01T00:00:00Z', deliveries: [] }],
     next_before_id: null,
   });
@@ -119,7 +125,10 @@ it('cancels a running run and reflects the terminal status', async () => {
 it('surfaces failed runs as a model configuration problem and blocks sending', async () => {
   loginResponses();
   set('/sessions/s1/messages', {
-    items: [{ id: 1, role: 'user', content: '分析销量', created_at: '2026-01-01T00:00:00Z', run_id: 'r1' }],
+    items: [
+      { id: 1, role: 'user', content: '分析销量', created_at: '2026-01-01T00:00:00Z', run_id: null },
+      { id: 2, role: 'assistant', content: '分析失败', created_at: '2026-01-01T00:00:01Z', run_id: 'r1' },
+    ],
     runs: [{ id: 'r1', status: 'failed', error_code: 'model_config_unavailable', created_at: '2026-01-01T00:00:00Z', deliveries: [] }],
     next_before_id: null,
   });
@@ -132,7 +141,8 @@ it('surfaces failed runs as a model configuration problem and blocks sending', a
 it('shows delivery unknown retry with explicit duplicate confirmation', async () => {
   loginResponses();
   set('/sessions/s1/messages', {
-    items: [], runs: [{ id: 'r1', status: 'completed', error_code: null, created_at: '2026-01-01T00:00:00Z', deliveries: [{ id: 'd1', status: 'unknown' }] }],
+    items: [{ id: 1, role: 'assistant', content: '分析完成', created_at: '2026-01-01T00:00:00Z', run_id: 'r1' }],
+    runs: [{ id: 'r1', status: 'completed', error_code: null, created_at: '2026-01-01T00:00:00Z', deliveries: [{ id: 'd1', status: 'unknown' }] }],
     next_before_id: null,
   });
   await login();

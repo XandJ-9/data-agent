@@ -1,6 +1,7 @@
 """Reusable runtime core contracts: injection-based, no Settings, storage or network."""
 
 import json
+from collections.abc import Callable
 from unittest.mock import Mock
 
 import pytest
@@ -27,6 +28,19 @@ class FakeProvider:
     def complete(self, config: RuntimeConfig, messages: list[dict], tools: list[dict] | None) -> ModelReply:
         self.calls.append({"config": config, "messages": [dict(m) for m in messages], "tools": tools})
         return self.replies.pop(0)
+
+    def stream_complete(self, config: RuntimeConfig, messages: list[dict], tools: list[dict] | None,
+                        on_text: Callable[[str], None],
+                        on_reasoning: Callable[[str], None] | None = None) -> ModelReply:
+        self.calls.append({"config": config, "messages": [dict(m) for m in messages], "tools": tools})
+        reply = self.replies.pop(0)
+        if reply.reasoning and on_reasoning is not None:
+            for char in reply.reasoning:
+                on_reasoning(char)
+        if reply.content:
+            for char in reply.content:
+                on_text(char)
+        return reply
 
 
 def reply(content: str | None = None, *calls: ToolCall) -> ModelReply:
@@ -156,9 +170,21 @@ def test_on_event_observes_assistant_tool_calls_and_results() -> None:
     events: list[dict] = []
     assert respond(make_runtime(provider), echo_registry(), on_event=events.append) == "final"
     assert events == [
-        {'kind': 'assistant', 'content': '先检索', 'reasoning': '需要历史'},
+        {'kind': 'reasoning', 'content': '需'},
+        {'kind': 'reasoning', 'content': '要'},
+        {'kind': 'reasoning', 'content': '历'},
+        {'kind': 'reasoning', 'content': '史'},
+        {'kind': 'text', 'content': '先'},
+        {'kind': 'text', 'content': '检'},
+        {'kind': 'text', 'content': '索'},
+        {'kind': 'assistant', 'content': '先检索'},
         {'kind': 'tool_call', 'name': 'echo', 'content': '{"text": "hi"}'},
         {'kind': 'tool_result', 'name': 'echo', 'content': json.dumps({"echo": "hi"})},
+        {'kind': 'text', 'content': 'f'},
+        {'kind': 'text', 'content': 'i'},
+        {'kind': 'text', 'content': 'n'},
+        {'kind': 'text', 'content': 'a'},
+        {'kind': 'text', 'content': 'l'},
     ]
 
 
@@ -166,7 +192,30 @@ def test_final_round_reasoning_is_emitted_without_duplicating_content() -> None:
     provider = FakeProvider(ModelReply(content='done', reasoning='deduced the answer'))
     events: list[dict] = []
     assert respond(make_runtime(provider), echo_registry(), on_event=events.append) == "done"
-    assert events == [{'kind': 'assistant', 'content': '', 'reasoning': 'deduced the answer'}]
+    assert events == [
+        {'kind': 'reasoning', 'content': 'd'},
+        {'kind': 'reasoning', 'content': 'e'},
+        {'kind': 'reasoning', 'content': 'd'},
+        {'kind': 'reasoning', 'content': 'u'},
+        {'kind': 'reasoning', 'content': 'c'},
+        {'kind': 'reasoning', 'content': 'e'},
+        {'kind': 'reasoning', 'content': 'd'},
+        {'kind': 'reasoning', 'content': ' '},
+        {'kind': 'reasoning', 'content': 't'},
+        {'kind': 'reasoning', 'content': 'h'},
+        {'kind': 'reasoning', 'content': 'e'},
+        {'kind': 'reasoning', 'content': ' '},
+        {'kind': 'reasoning', 'content': 'a'},
+        {'kind': 'reasoning', 'content': 'n'},
+        {'kind': 'reasoning', 'content': 's'},
+        {'kind': 'reasoning', 'content': 'w'},
+        {'kind': 'reasoning', 'content': 'e'},
+        {'kind': 'reasoning', 'content': 'r'},
+        {'kind': 'text', 'content': 'd'},
+        {'kind': 'text', 'content': 'o'},
+        {'kind': 'text', 'content': 'n'},
+        {'kind': 'text', 'content': 'e'},
+    ]
 
 
 def test_no_events_without_observer() -> None:
@@ -181,3 +230,57 @@ def test_complete_is_a_single_provider_round_trip() -> None:
     assert result.content == "plain" and result.tool_calls == ()
     assert provider.calls[0]["tools"] is None
     assert provider.calls[0]["messages"] == [{"role": "user", "content": "hi"}]
+
+
+def test_oversized_tool_result_is_trimmed_instead_of_rejected() -> None:
+    """When a large tool result causes context overflow, the runtime trims
+    it rather than raising RuntimeFailure immediately."""
+    # Use a tight context budget so the oversized tool result overflows.
+    provider = FakeProvider(
+        reply(None, ToolCall(id="b1", name="big_echo", arguments='{"text": "x"}')),
+        reply("recovered after trim"),
+    )
+    registry = ToolRegistry()
+    registry.register(ToolDefinition(
+        name="big_echo", description="Returns a huge payload.",
+        parameters={"text": {"type": "string"}}, required=["text"],
+        handler=lambda _: {"data": "y" * 8000},
+    ))
+    # 8K chars ≈ 8K+ bytes > the 8000-byte context_tokens default.
+    result = respond(make_runtime(provider, context_tokens=4000), registry)
+    assert result == "recovered after trim"
+    # The second call's context should contain the trimmed tool result
+    # (either Phase 1.5 truncation or Phase 2 placeholder, both carry a marker).
+    tool_msgs = [m for m in provider.calls[1]["messages"] if m["role"] == "tool"]
+    assert tool_msgs
+    trimmed = tool_msgs[0]["content"]
+    assert len(trimmed) < 8200  # definitely shorter than the 8000+ char original
+    assert "截断" in trimmed or "省略" in trimmed or "工具结果" in trimmed
+
+
+def test_phase_three_drops_oldest_round_when_placeholders_not_enough() -> None:
+    """When every tool result is too small to trim but the cumulative
+    assistant+tool rounds overflow the budget, phase 3 drops the oldest
+    complete round."""
+    provider = FakeProvider(
+        reply(None, ToolCall(id="r1", name="echo", arguments='{"text": "a"}')),
+        reply(None, ToolCall(id="r2", name="echo", arguments='{"text": "b"}')),
+        reply("done after round drop"),
+    )
+    registry = echo_registry()
+    # Large system prompt + two rounds overflows; echo results are tiny so
+    # phases 1–2 cannot help.  Phase 3 drops round 1, leaving exactly one
+    # assistant round for the final completion.
+    result = respond(
+        make_runtime(provider, system_prompt="X" * 3000, context_tokens=4000),
+        registry,
+    )
+    assert result == "done after round drop"
+    messages_after_trim = provider.calls[2]["messages"]
+    assistant_count = sum(
+        1 for m in messages_after_trim
+        if m.get("role") == "assistant" and m.get("tool_calls")
+    )
+    assert assistant_count == 1
+    assert any(m.get("role") == "system" for m in messages_after_trim)
+    assert any(m.get("content") == "question" for m in messages_after_trim)

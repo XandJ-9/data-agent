@@ -17,17 +17,17 @@ class ChannelsRepository(BaseRepository):
     def purge_codes(self, conn: Connection, user_id: str) -> None:
         conn.execute(binding_codes.delete().where(binding_codes.c.user_id == user_id))
 
-    def create_code(self, conn: Connection, code_hash: str, user_id: str, expires_at: float) -> None:
+    def create_code(self, conn: Connection, code_hash: str, user_id: str, expires_at: str) -> None:
         conn.execute(binding_codes.insert(), {'code_hash': code_hash, 'user_id': user_id,
                                               'expires_at': expires_at})
 
-    def find_code(self, conn: Connection, code_hash: str, now: float) -> dict | None:
+    def find_code(self, conn: Connection, code_hash: str, now: str) -> dict | None:
         return self._row(conn.execute(
             select(binding_codes).where(binding_codes.c.code_hash == code_hash,
                                         binding_codes.c.consumed_at.is_(None),
                                         binding_codes.c.expires_at > now)))
 
-    def consume_code(self, conn: Connection, code_hash: str, now: float) -> dict | None:
+    def consume_code(self, conn: Connection, code_hash: str, now: str) -> dict | None:
         return self._row(conn.execute(update(binding_codes).where(
             binding_codes.c.code_hash == code_hash, binding_codes.c.consumed_at.is_(None),
             binding_codes.c.expires_at > now).values(consumed_at=now).returning(binding_codes)))

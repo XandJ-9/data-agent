@@ -4,6 +4,7 @@ import hashlib
 from sqlalchemy import case, func, select
 from sqlalchemy.engine import Connection
 
+from clock import iso_minus
 from storage.repositories.base import BaseRepository
 from storage.schema import feishu_bind_attempts, feishu_events, feishu_replies
 
@@ -32,19 +33,20 @@ class FeishuRepository(BaseRepository):
                             .where(feishu_events.c.message_id == message_id)).first() is not None
 
     def record_event(self, conn: Connection, app_id: str, tenant_id: str, event_id: str,
-                     message_id: str | None, received_at: float) -> None:
+                     message_id: str | None, received_at: str) -> None:
         conn.execute(feishu_events.insert(), {'app_id': app_id, 'tenant_id': tenant_id, 'event_id': event_id,
                                               'message_id': message_id, 'received_at': received_at})
 
     def bind_attempt_allowed(self, conn: Connection, key: str, window_seconds: int, max_attempts: int,
-                             now: float) -> bool:
+                             now: str) -> bool:
         """Bounded attempt counter keyed by the verified external identity."""
         from sqlalchemy.dialects import postgresql, sqlite
         if max_attempts <= 0:
             return False
+        cutoff = iso_minus(now, window_seconds)
         construct = sqlite.insert if conn.dialect.name == 'sqlite' else postgresql.insert
         table = feishu_bind_attempts
-        expired = table.c.window_start <= now - window_seconds
+        expired = table.c.window_start <= cutoff
         statement = construct(table).values(identity_key=key, window_start=now, attempts=1)
         result = conn.execute(statement.on_conflict_do_update(
             index_elements=[table.c.identity_key],
@@ -54,7 +56,7 @@ class FeishuRepository(BaseRepository):
         return result.first() is not None
 
     def enqueue_reply(self, conn: Connection, reply_id: str, app_id: str, tenant_id: str,
-                      external_user_id: str, content: str, uuid: str, created_at: float) -> None:
+                      external_user_id: str, content: str, uuid: str, created_at: str) -> None:
         conn.execute(feishu_replies.insert(), {
             'id': reply_id, 'app_id': app_id, 'tenant_id': tenant_id, 'external_user_id': external_user_id,
             'reply_target': external_user_id, 'content': content, 'uuid': uuid, 'created_at': created_at})

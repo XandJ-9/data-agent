@@ -2,7 +2,7 @@
 import hashlib
 import json
 import logging
-import time
+from clock import now_iso
 
 from errors import ServiceError
 from ids import identifier
@@ -63,11 +63,11 @@ def submit_message_conn(conn, store: Store, settings: Settings, user_id: str, se
     run_id = identifier()
     store.runs.insert(conn, {
         'id': run_id, 'user_id': user_id, 'session_id': session_id,
-        'client_message_id': client_message_id, 'created_at': time.time(),
+        'client_message_id': client_message_id, 'created_at': now_iso(),
         'definition_hash': hashlib.sha256(definition.encode()).hexdigest(),
         'skills_snapshot': json.dumps(snapshot), 'config_snapshot': json.dumps(config),
         'source': source, 'binding_id': binding_id, 'reply_target': reply_target})
-    message_id = store.messages_repo.insert(conn, user_id, session_id, run_id, 'user', text, time.time())
+    message_id = store.messages_repo.insert(conn, user_id, session_id, run_id, 'user', text, now_iso())
     store.runs.set_input_message(conn, run_id, message_id)
     logger.info('Message submitted (run=%s session=%s user=%s len=%s source=%s)',
                run_id, session_id, user_id, len(text), source)
@@ -75,20 +75,22 @@ def submit_message_conn(conn, store: Store, settings: Settings, user_id: str, se
 
 
 def prompt_messages(store: Store, run: dict) -> list[dict]:
+    """Collect every successful complete user/assistant round (untrimmed).
+
+    The 32000-character pre-trim that was previously here has been removed:
+    build_context() is the single decision point and uses token-aware
+    estimation instead of raw character counts."""
     with store.transaction(immediate=False) as conn:
         # Select previous successful complete rounds by their INPUT sequence. Replies may
         # have IDs after this input because multiple questions can already be queued.
         prior = store.runs.succeeded_inputs_before(conn, run['session_id'], run['input_message_id'])
         rounds = [store.messages_repo.by_run_ordered(conn, run_id) for run_id in reversed(prior)]
         current = store.messages_repo.by_id(conn, run['input_message_id'])
-    selected, remaining = [], 32000
+    # Return all candidate rounds + current; build_context owns the budget decision.
+    selected: list[dict] = []
     for pair in reversed(rounds):
-        size = sum(len(m['content']) for m in pair)
-        if size > remaining:
-            break
         selected = pair + selected
-        remaining -= size
-    return selected + [current]
+    return [*selected, current]
 
 
 def search_history(store: Store, run: dict, args: dict) -> list[dict]:

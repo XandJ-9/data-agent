@@ -138,6 +138,17 @@ class McpGateway:
         self._sessions[name] = opened
         return opened
 
+    def test_server(self, config: dict) -> list[ToolDefinition]:
+        """List tools for a single server, raising McpError on failure.
+
+        Unlike tool_definitions(), this does not catch per-server errors —
+        the caller gets the raw exception to report to the admin.
+        """
+        loop = self._ensure_loop()
+        tools = self._list_tools(loop, config)
+        return to_definitions(config['name'], tools,
+                              lambda tool, cfg=config: self._handler(cfg, tool))
+
     # ------------------------------------------------------------ public API
 
     def tool_definitions(self, *, refresh: bool = False) -> list[ToolDefinition]:

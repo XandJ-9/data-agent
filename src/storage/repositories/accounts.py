@@ -29,13 +29,13 @@ class AccountsRepository(BaseRepository):
         else:
             conn.execute(delete(admins).where(admins.c.user_id == user_id))
 
-    def purge_expired_attempts(self, conn: Connection, before: float) -> None:
+    def purge_expired_attempts(self, conn: Connection, before: str) -> None:
         conn.execute(delete(login_attempts).where(login_attempts.c.window_start < before))
 
     def attempt_count(self, conn: Connection, key: str) -> int | None:
         return conn.execute(select(login_attempts.c.attempts).where(login_attempts.c.key == key)).scalar()
 
-    def record_attempt(self, conn: Connection, key: str, now: float) -> bool:
+    def record_attempt(self, conn: Connection, key: str, now: str) -> bool:
         from sqlalchemy.dialects import postgresql, sqlite
         construct = sqlite.insert if conn.dialect.name == 'sqlite' else postgresql.insert
         statement = construct(login_attempts).values(key=key, attempts=1, window_start=now)
@@ -44,15 +44,15 @@ class AccountsRepository(BaseRepository):
             set_={'attempts': login_attempts.c.attempts + 1},
             where=login_attempts.c.attempts < 20).returning(login_attempts.c.key)).first() is not None
 
-    def purge_expired_sessions(self, conn: Connection, now: float) -> None:
+    def purge_expired_sessions(self, conn: Connection, now: str) -> None:
         conn.execute(delete(auth_sessions).where(auth_sessions.c.expires_at <= now))
 
     def insert_session(self, conn: Connection, token_hash: str, user_id: str, csrf_token: str,
-                       expires_at: float) -> None:
+                       expires_at: str) -> None:
         conn.execute(insert(auth_sessions), {'token_hash': token_hash, 'user_id': user_id,
                                                     'csrf_token': csrf_token, 'expires_at': expires_at})
 
-    def identity_by_token(self, conn: Connection, token_hash: str, now: float) -> dict | None:
+    def identity_by_token(self, conn: Connection, token_hash: str, now: str) -> dict | None:
         return self._row(conn.execute(
             select(users.c.id, users.c.username, auth_sessions.c.csrf_token,
                    admins.c.user_id.is_not(None).label('is_admin'))

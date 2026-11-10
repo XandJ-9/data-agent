@@ -11,7 +11,7 @@ from storage.schema import run_steps
 
 
 class RunStepsRepository(BaseRepository):
-    def append(self, conn: Connection, run_id: str, seq: int, event: dict, now: float) -> None:
+    def append(self, conn: Connection, run_id: str, seq: int, event: dict, now: str) -> None:
         conn.execute(insert(run_steps), {
             'run_id': run_id, 'seq': seq, 'kind': event['kind'], 'name': event.get('name'),
             'content': event.get('content', ''), 'reasoning': event.get('reasoning'),

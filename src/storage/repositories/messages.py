@@ -10,7 +10,7 @@ PAGE_LIMIT = 100
 
 class MessagesRepository(BaseRepository):
     def insert(self, conn: Connection, user_id: str, session_id: str, run_id: str, role: str,
-               content: str, created_at: float) -> int:
+               content: str, created_at: str) -> int:
         result = conn.execute(insert(messages), {
             'user_id': user_id, 'session_id': session_id, 'run_id': run_id,
             'role': role, 'content': content, 'created_at': created_at})

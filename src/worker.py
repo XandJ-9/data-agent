@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from channels.feishu.delivery import SdkSender, process_deliveries, process_replies
+from clock import now_iso
 from domains.data import DataAgentRuntime
 from errors import ServiceError
 from ids import identifier
@@ -58,7 +59,7 @@ def _execute_with_store(store: Store, settings: Settings, run: dict, owner: str,
         enabled = store.enabled_skills(run['user_id'])
         skills = [s for s in json.loads(run['skills_snapshot']) if enabled.get(s['name'], True)]
 
-        mcp_tools = _resolve_mcp_tools(mcp_gateway, store)
+        mcp_tools = _resolve_mcp_tools(mcp_gateway)
 
         reply = runtime.respond(
             messages=prompt_messages(store, run), memories=memory['entries'], skills=skills,
@@ -66,7 +67,7 @@ def _execute_with_store(store: Store, settings: Settings, run: dict, owner: str,
             cancelled=lambda: _cancelled(store, run),
             on_event=_step_recorder(store, run),
             mcp_tools=mcp_tools)
-        if not isinstance(reply, str) or not reply.strip() or len(reply) > 64000:
+        if not isinstance(reply, str) or not reply.strip() or len(reply) > 16000:
             raise ValueError('Invalid runtime reply')
         store.finish_run(run, reply)
         logger.info('Run %s succeeded in %.1fs (thread=%s)', run['id'], time.time() - started,
@@ -108,22 +109,63 @@ def _tool(store: Store, run: dict, name: str, args: dict):
 
 
 def _step_recorder(store: Store, run: dict):
+    """Returns an on_event callback that buffers consecutive streaming
+    text/reasoning deltas and flushes them as consolidated rows at
+    structural boundaries (tool calls, results) or periodically.
+
+    This keeps the run_steps table from ballooning: hundreds of
+    single-token rows collapse into a handful of consolidated chunks.
+    """
     seq = 0
+    text_buf: list[str] = []
+    reasoning_buf: list[str] = []
+    last_flush = 0.0
+
+    def _flush_buffers() -> None:
+        nonlocal seq, last_flush
+        now = time.time()
+        if reasoning_buf:
+            seq += 1
+            store.append_step(run['id'], seq,
+                              {'kind': 'reasoning', 'content': ''.join(reasoning_buf)}, now_iso())
+            reasoning_buf.clear()
+        if text_buf:
+            seq += 1
+            store.append_step(run['id'], seq,
+                              {'kind': 'text', 'content': ''.join(text_buf)}, now_iso())
+            text_buf.clear()
+        last_flush = now
 
     def on_event(event: dict) -> None:
         nonlocal seq
+        kind = event['kind']
+
+        if kind in ('text', 'reasoning'):
+            if kind == 'text':
+                text_buf.append(event['content'])
+            else:
+                reasoning_buf.append(event['content'])
+            # Flush when enough content has accumulated, or at a time boundary
+            # so the SSE endpoint picks up fresh rows between poll cycles.
+            total = sum(len(''.join(buf)) for buf in (text_buf, reasoning_buf))
+            if time.time() - last_flush >= 0.4 or total >= 120:
+                _flush_buffers()
+            return
+
+        # Structural event: flush streaming buffers first, then persist the event.
+        _flush_buffers()
         seq += 1
-        if event['kind'] == 'tool_call':
+        if kind == 'tool_call':
             logger.info('Run %s tool %s(%s)', run['id'], event['name'], event['content'][:200])
         try:
-            store.append_step(run['id'], seq, event, time.time())
+            store.append_step(run['id'], seq, event, now_iso())
         except Exception:
             logger.warning('Step persist failed for run %s seq %s', run['id'], seq)
 
     return on_event
 
 
-def _resolve_mcp_tools(mcp_gateway: McpGateway | None, store: Store) -> list:
+def _resolve_mcp_tools(mcp_gateway: McpGateway | None) -> list:
     if mcp_gateway is not None:
         try:
             return mcp_gateway.tool_definitions()
@@ -145,7 +187,8 @@ class Worker:
         self.store = Store(settings.resolved_database_url)
         self.owner = identifier()
         self.runtime = runtime
-        self._mcp_gateway = mcp_gateway
+        self._mcp_gateway = mcp_gateway if mcp_gateway is not None else McpGateway(self.store)
+        self._owns_gateway = mcp_gateway is None
 
     def run_once(self) -> bool:
         """Claim and execute a single run synchronously (used in tests)."""
@@ -203,7 +246,7 @@ class Worker:
                     run = self.store.claim_run(self.owner, self.settings.lease_seconds)
                     if run is None:
                         break
-                    future = pool.submit(_execute, self.settings, run, self.owner, self._mcp_gateway)
+                    future = pool.submit(_execute, self.settings, run, self.owner, mcp_gateway=self._mcp_gateway)
                     futures[future] = run
 
                 # Background work
@@ -214,4 +257,6 @@ class Worker:
                     time.sleep(self.settings.poll_seconds)
 
     def close(self) -> None:
+        if self._owns_gateway:
+            self._mcp_gateway.close()
         self.store.dispose()

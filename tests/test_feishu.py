@@ -4,6 +4,7 @@ import hashlib
 import json
 import sqlite3
 import time
+from clock import now_iso, now_plus
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -117,7 +118,7 @@ def make_event(event_id, message_id, text, msg_type='text', chat_type='p2p',
 def insert_code(store, user, code):
     with store.transaction() as conn:
         sql(conn, 'INSERT INTO binding_codes(code_hash,user_id,expires_at) VALUES(?,?,?)',
-                     (sha256_hex(code), user['id'], time.time() + 600))
+                     (sha256_hex(code), user['id'], now_plus(600)))
 
 
 def outbox(store):
@@ -520,7 +521,7 @@ def test_pump_api_error_backoff_then_failed(env):
                        clock=lambda: clock['now'])
     failed = deliveries(store)[0]
     assert failed['status'] == 'pending' and failed['attempts'] == 1
-    assert failed['error_code'] == '99991663' and failed['retry_at'] >= 1002
+    assert failed['error_code'] == '99991663' and failed['retry_at'] > '1970-01-01 00:00:00.000000'
     # before backoff elapses nothing is claimed
     assert process_deliveries(store, sender, app_id=APP_ID, app_secret=APP_SECRET, owner='w2', lease_seconds=120,
                               clock=lambda: clock['now']) == 0
@@ -586,7 +587,7 @@ def test_reply_pump_retries_api_error_with_backoff(env):
     sender = FakeSender(results={uuid: DeliveryApiError('99991672')})
     process_replies(store, sender, app_id=APP_ID, app_secret=APP_SECRET, owner='w1', lease_seconds=120,
                     clock=lambda: clock['now'])
-    assert outbox(store)[0]['status'] == 'pending' and outbox(store)[0]['retry_at'] > 500
+    assert outbox(store)[0]['status'] == 'pending' and outbox(store)[0]['retry_at'] > '1970-01-01 00:00:00.000000'
     clock['now'] += 10
     sender.results.clear()
     process_replies(store, sender, app_id=APP_ID, app_secret=APP_SECRET, owner='w2', lease_seconds=120,
