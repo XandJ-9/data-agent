@@ -5,8 +5,7 @@ conveniences (one transaction each) and composites that must span several
 repos atomically (finish_run, consume_binding_code, retry_delivery).
 Method signatures are stable for services/api/channels/worker.
 """
-from clock import now_iso, now_plus
-
+from clock import now_iso
 from errors import ServiceError
 from ids import identifier
 from storage.database import Database

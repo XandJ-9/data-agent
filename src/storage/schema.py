@@ -9,7 +9,6 @@ Conventions (cross-backend invariant):
 from sqlalchemy import (
     CheckConstraint,
     Column,
-    Double,
     ForeignKey,
     Index,
     Integer,

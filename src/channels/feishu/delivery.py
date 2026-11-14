@@ -21,7 +21,7 @@ import threading
 import time
 from collections.abc import Callable
 
-from clock import from_timestamp, now_iso, now_plus
+from clock import from_timestamp
 
 FEISHU_TEXT_LIMIT = 3000
 MAX_ATTEMPTS = 8

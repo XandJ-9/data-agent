@@ -2,8 +2,8 @@
 import json
 import logging
 import re
-from clock import now_iso, now_plus
 
+from clock import now_iso, now_plus
 from errors import ServiceError
 from ids import identifier
 from storage import Store

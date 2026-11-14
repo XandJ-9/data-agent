@@ -1,12 +1,11 @@
 """Real PostgreSQL READ COMMITTED regressions; opt in with --run-postgres."""
-import time
-from clock import SENTINEL, now_iso, now_plus
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 
 import pytest
 from sqlalchemy import inspect, select
 
+from clock import SENTINEL, now_iso, now_plus
 from errors import ServiceError
 from services.chat import submit_message
 from services.memory import compress_one, get_memory, replace_memory

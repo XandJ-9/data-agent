@@ -1,11 +1,10 @@
 """Outbox rows for channel delivery (deliveries, feishu_replies): same state
 machine, parameterized by table. The pump claims with a conditional UPDATE
 (status guard + rowcount) so concurrent workers never double-claim."""
-from clock import now_iso, now_plus
-
 from sqlalchemy import select, update
 from sqlalchemy.engine import Connection
 
+from clock import now_iso, now_plus
 from storage.repositories.base import BaseRepository
 
 
@@ -34,7 +33,9 @@ class OutboxRepository(BaseRepository):
         return claimed
 
     def finish(self, conn: Connection, row: dict, status: str, *, receipt: str | None = None,
-               error_code: str | None = None, retry_at: str = '1970-01-01 00:00:00.000000', now: str | None = None) -> bool:
+               error_code: str | None = None,
+               retry_at: str = '1970-01-01 00:00:00.000000',
+               now: str | None = None) -> bool:
         """Fenced transition out of 'sending'; a lost lease means another owner moved on."""
         cursor = conn.execute(update(self.table)
                               .where(self.table.c.id == row['id'], self.table.c.status == 'sending',

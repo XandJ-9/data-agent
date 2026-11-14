@@ -2,13 +2,11 @@
 import sqlite3
 
 import pytest
-from clock import SENTINEL, now_iso, now_plus
 from fastapi.testclient import TestClient
 from sqlalchemy import inspect, select, update
-from sqlalchemy.dialects import postgresql
-from sqlalchemy.schema import CreateTable
 
 from api import create_app
+from clock import SENTINEL, now_iso, now_plus
 from errors import ServiceError
 from services.chat import submit_message
 from settings import Settings
@@ -68,7 +66,6 @@ def test_init_rejects_newer_schema_before_creating_tables(tmp_path):
 def test_epoch_is_double_precision():
     """Timestamp columns are now Text; this test verifies the schema change is deliberate."""
     from sqlalchemy import Text as SAText
-    from storage.schema import auth_sessions
     created_at_col = auth_sessions.c.expires_at
     assert isinstance(created_at_col.type, SAText)
 

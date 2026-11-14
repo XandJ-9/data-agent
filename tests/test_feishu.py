@@ -4,7 +4,6 @@ import hashlib
 import json
 import sqlite3
 import time
-from clock import now_iso, now_plus
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -34,6 +33,7 @@ from channels.feishu.webhook import (
     generate_code,
     sha256_hex,
 )
+from clock import now_plus
 from ids import identifier
 from services.accounts import create_user
 from settings import Settings

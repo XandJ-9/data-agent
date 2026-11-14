@@ -1,5 +1,3 @@
-import time
-from clock import now_iso, now_plus
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -7,6 +5,7 @@ from conftest import sql
 from fastapi.testclient import TestClient
 
 from api import create_app
+from clock import now_plus
 from errors import ServiceError
 from services.chat import submit_message
 from services.memory import compress_one, get_memory, replace_memory

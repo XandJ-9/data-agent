@@ -2,7 +2,6 @@
 import asyncio
 import json
 import shutil
-from clock import now_iso, now_plus
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, Query, Request, Response
@@ -10,6 +9,7 @@ from starlette.responses import StreamingResponse
 
 from api import deps, schemas
 from channels.feishu.webhook import generate_code, sha256_hex
+from clock import now_iso, now_plus
 from errors import ServiceError
 from ids import identifier
 from mcp_gateway.manager import McpGateway
@@ -97,7 +97,7 @@ def run(run_id: str, identity: dict = Depends(deps.current), store=Depends(deps.
 
 @router.get('/api/v1/runs/{run_id}/steps/stream')
 async def steps_stream(run_id: str, identity: dict = Depends(deps.current), store=Depends(deps.store)):
-    run = store.get_run(identity['user']['id'], run_id)  # ownership check
+    store.get_run(identity['user']['id'], run_id)  # ownership check
 
     async def events():
         seen = 0

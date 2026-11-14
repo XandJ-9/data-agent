@@ -4,11 +4,10 @@ Single-repo conveniences (one transaction) live on the Store facade; composite
 lifecycle transitions (finish_run composing messages/outbox/memory) are also
 facade methods because they span repos inside one transaction.
 """
-from clock import now_iso, now_plus
-
 from sqlalchemy import exists, func, select, update
 from sqlalchemy.engine import Connection
 
+from clock import now_iso, now_plus
 from errors import ServiceError
 from storage.repositories.base import BaseRepository
 from storage.schema import runs, sessions

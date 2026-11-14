@@ -1,11 +1,11 @@
 """Account use cases: local accounts and opaque, hashed server-side browser sessions."""
 import hashlib
 import secrets
-from clock import now_iso, now_plus
 
 from argon2 import PasswordHasher
 from argon2.exceptions import VerificationError
 
+from clock import now_iso, now_plus
 from errors import ServiceError
 from ids import identifier
 from storage import Store

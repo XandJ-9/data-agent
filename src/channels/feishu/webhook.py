@@ -25,12 +25,11 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 
-from clock import now_iso
-
 from lark_oapi.core.model import RawRequest
 from lark_oapi.event.custom import CustomizedEvent
 from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
 
+from clock import now_iso
 from errors import ServiceError
 from ids import identifier
 from services.chat import submit_message_conn

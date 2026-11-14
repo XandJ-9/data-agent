@@ -2,8 +2,8 @@
 import hashlib
 import json
 import logging
-from clock import now_iso
 
+from clock import now_iso
 from errors import ServiceError
 from ids import identifier
 from settings import Settings
